@@ -103,6 +103,37 @@ async def chat_completions(request: Request):
                         }
                         yield f"data: {json.dumps(tc_chunk)}\n\n"
 
+            # flush 残余文本
+            safe_text, tool_calls = sieve.flush()
+            full_text += safe_text
+            if safe_text:
+                chunk = {
+                    "id": "chatcmpl-123",
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": safe_text}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+            
+            for tc in tool_calls:
+                log.info(f"[OAI] Tool Call Emitted (flushed): {tc.get('name')} with args: {tc.get('input')}")
+                tc_chunk = {
+                    "id": "chatcmpl-123",
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {
+                        "tool_calls": [{
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name", ""),
+                                "arguments": json.dumps(tc.get("input", {}))
+                            }
+                        }]
+                    }, "finish_reason": "tool_calls"}]
+                }
+                yield f"data: {json.dumps(tc_chunk)}\n\n"
+
             # 打印最终输出长度便于调试
             log.info(f"[OAI] Request complete. Generated {len(full_text)} characters.")
                     

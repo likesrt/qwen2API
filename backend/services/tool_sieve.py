@@ -49,3 +49,12 @@ class ToolSieve:
             self.buffer = ""
 
         return emitted_text, tool_calls
+
+    def flush(self) -> tuple[str, list[dict]]:
+        """
+        流结束时，将缓冲区的剩余文本强制刷出。
+        返回 (剩余安全文本, 解析出的最后工具调用)
+        """
+        emitted_text = self.buffer
+        self.buffer = ""
+        return emitted_text, []
