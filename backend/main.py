@@ -3,6 +3,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import os
 from backend.core.config import settings
 from backend.core.database import AsyncJsonDB
 from backend.core.browser_engine import BrowserEngine
@@ -56,13 +58,20 @@ app.include_router(embeddings.router, prefix="/v1", tags=["Embeddings"])
 app.include_router(probes.router, tags=["Probes"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Dashboard Admin"])
 
-@app.get("/", tags=["System"])
+@app.get("/api", tags=["System"])
 async def root():
     return {
         "status": "qwen2API Enterprise Gateway is running",
         "docs": "/docs",
         "version": "2.0.0"
     }
+
+# 托管前端构建产物
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
+if os.path.exists(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    log.warning(f"Frontend dist not found at {FRONTEND_DIST}. WebUI will not be available.")
 
 if __name__ == "__main__":
     import uvicorn
