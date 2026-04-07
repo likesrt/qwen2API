@@ -202,6 +202,13 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
     if sys_part: parts.append(sys_part)
     if tools_part: parts.append(tools_part)
     parts.extend(history_parts)
+    
+    if tools:
+        parts.append(
+            "[REMINDER: When calling a tool, you MUST use ✿ACTION✿{\"action\": \"NAME\", \"args\": {...}}✿END_ACTION✿ format. "
+            "DO NOT use any other format.]"
+        )
+        
     parts.append("Assistant:")
     return "\n\n".join(parts)
 

@@ -70,9 +70,10 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
                 answer_chunks = []
+                thinking_chunks = []
                 native_tc_chunks = {}
                 
-                async for item in client.chat_stream_events_with_retry(model, current_prompt):
+                async for item in client.chat_stream_events_with_retry(model, current_prompt, has_custom_tools=bool(tools)):
                     if item["type"] == "meta":
                         chat_id = item["chat_id"]
                         acc = item["acc"]
@@ -88,7 +89,7 @@ async def chat_completions(request: Request):
                         
                         if phase in ("think", "thinking_summary") and cont:
                             # 隐藏思考过程，不在客户端显示
-                            pass
+                            thinking_chunks.append(cont)
                             
                         elif phase == "answer" and cont:
                             answer_chunks.append(cont)
@@ -109,6 +110,24 @@ async def chat_completions(request: Request):
                                 native_tc_chunks[tc_id]["args"] += cont
 
                 answer_text = "".join(answer_chunks)
+
+                if not answer_text.strip() and thinking_chunks and tools:
+                    thinking_text = "".join(thinking_chunks)
+                    if "✿ACTION✿" in thinking_text or "<tool_call>" in thinking_text:
+                        log.info("[OAI] 在思考阶段发现工具调用，提取使用")
+                        answer_text = thinking_text
+
+                if not answer_text.strip() and not native_tc_chunks and tools and stream_attempt < 4:
+                    log.warning(f"[OAI] answer为空但有工具定义，可能是模型只在思考阶段输出了内容，尝试重试 (attempt {stream_attempt+1}/5)")
+                    if acc:
+                        client.account_pool.release(acc)
+                        if chat_id:
+                            import asyncio
+                            asyncio.create_task(client.delete_chat(acc.token, chat_id))
+                    current_prompt += "\n\n[IMPORTANT: You MUST respond with a tool call using ✿ACTION✿ format. Do NOT just think silently.]\n\nAssistant:"
+                    import asyncio
+                    await asyncio.sleep(0.5)
+                    continue
                 
                 if native_tc_chunks:
                     log.info(f"[Native-TC] 收到原生工具调用事件: {list(native_tc_chunks.keys())}")

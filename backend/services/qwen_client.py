@@ -131,7 +131,7 @@ class QwenClient:
             "auto_thinking": True, "thinking_mode": "Auto", "thinking_format": "summary",
             "auto_search": False,
             "code_interpreter": False,
-            "function_calling": False,
+            "function_calling": has_custom_tools,
             "plugins_enabled": False,
         }
         return {
@@ -175,7 +175,7 @@ class QwenClient:
                 })
         return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str):
+    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = True):
         """无感容灾重试逻辑：上游挂了自动换号"""
         exclude = set()
         for attempt in range(settings.MAX_RETRIES):
@@ -185,7 +185,7 @@ class QwenClient:
                 
             try:
                 chat_id = await self.create_chat(acc.token, model)
-                payload = self._build_payload(chat_id, model, content)
+                payload = self._build_payload(chat_id, model, content, has_custom_tools)
                 
                 # First yield the chat_id and account to the consumer
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
