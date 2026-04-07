@@ -88,7 +88,6 @@ async def anthropic_messages(request: Request):
                 answer_chunks = []
                 native_tc_chunks = {}
                 block_idx = 0
-                in_thinking_block = False
                 
                 async for item in client.chat_stream_events_with_retry(model, current_prompt):
                     if item["type"] == "meta":
@@ -105,26 +104,13 @@ async def anthropic_messages(request: Request):
                         cont = evt.get("content", "")
                         
                         if phase in ("think", "thinking_summary") and cont:
-                            if not in_thinking_block:
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-                                in_thinking_block = True
-                            
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': cont}})}\n\n"
+                            # 隐藏思考过程，不在客户端显示
+                            pass
                             
                         elif phase == "answer" and cont:
-                            if in_thinking_block:
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
-                                in_thinking_block = False
-                                block_idx += 1
-                                
                             answer_chunks.append(cont)
                             
                         elif phase == "tool_call" and cont:
-                            if in_thinking_block:
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
-                                in_thinking_block = False
-                                block_idx += 1
-                                
                             tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
                             if tc_id not in native_tc_chunks:
                                 native_tc_chunks[tc_id] = {"name": "", "args": ""}
@@ -136,11 +122,6 @@ async def anthropic_messages(request: Request):
                                     native_tc_chunks[tc_id]["args"] += chunk_json["arguments"]
                             except (json.JSONDecodeError, ValueError):
                                 native_tc_chunks[tc_id]["args"] += cont
-
-                if in_thinking_block:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
-                    in_thinking_block = False
-                    block_idx += 1
 
                 answer_text = "".join(answer_chunks)
 

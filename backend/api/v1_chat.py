@@ -87,14 +87,8 @@ async def chat_completions(request: Request):
                         cont = evt.get("content", "")
                         
                         if phase in ("think", "thinking_summary") and cont:
-                            # Stream reasoning immediately
-                            chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [{"index": 0, "delta": {"content": cont}, "finish_reason": None}]
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            # 隐藏思考过程，不在客户端显示
+                            pass
                             
                         elif phase == "answer" and cont:
                             answer_chunks.append(cont)
