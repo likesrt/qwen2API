@@ -235,7 +235,7 @@ async def anthropic_messages(request: Request):
                         if acc:
                             client.account_pool.release(acc)
                             if chat_id:
-                                import asyncio
+
                                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
                         if acc: excluded_accounts.add(acc.email)
                         log.warning(f"[NativeBlock-ANT] Qwen拦截了工具 '{blocked_name}' 的原生调用，注入格式纠正后重试 (attempt {stream_attempt+1}/{max_attempts})")
@@ -258,7 +258,7 @@ async def anthropic_messages(request: Request):
                                 if acc:
                                     client.account_pool.release(acc)
                                     if chat_id:
-                                        import asyncio
+
                                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                                 current_prompt = current_prompt.rstrip()
                                 force_text = (
@@ -278,7 +278,7 @@ async def anthropic_messages(request: Request):
                                 if acc:
                                     client.account_pool.release(acc)
                                     if chat_id:
-                                        import asyncio
+
                                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                                 current_prompt = current_prompt.rstrip()
                                 n = tool_blk.get("name", "")
@@ -299,7 +299,7 @@ async def anthropic_messages(request: Request):
                         if acc:
                             client.account_pool.release(acc)
                             if chat_id:
-                                import asyncio
+
                                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
                         current_prompt = current_prompt.rstrip()
                         if current_prompt.endswith("Assistant:"):
@@ -357,7 +357,7 @@ async def anthropic_messages(request: Request):
                 if acc:
                     client.account_pool.release(acc)
                     if chat_id:
-                        import asyncio
+
                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 return
               except HTTPException as he:
@@ -367,7 +367,7 @@ async def anthropic_messages(request: Request):
                 if acc and acc.inflight > 0:
                     client.account_pool.release(acc)
                     if chat_id:
-                        import asyncio
+
                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
                 return
@@ -441,7 +441,7 @@ async def anthropic_messages(request: Request):
                         if acc:
                             client.account_pool.release(acc)
                             if chat_id:
-                                import asyncio
+
                                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
                         if acc: excluded_accounts.add(acc.email)
                         log.warning(f"[NativeBlock-ANT] Qwen拦截了工具 '{blocked_name}' 的原生调用，注入格式纠正后重试 (attempt {stream_attempt+1}/{max_attempts})")
@@ -464,7 +464,7 @@ async def anthropic_messages(request: Request):
                                 if acc:
                                     client.account_pool.release(acc)
                                     if chat_id:
-                                        import asyncio
+
                                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                                 current_prompt = current_prompt.rstrip()
                                 force_text = (
@@ -484,7 +484,7 @@ async def anthropic_messages(request: Request):
                                 if acc:
                                     client.account_pool.release(acc)
                                     if chat_id:
-                                        import asyncio
+
                                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                                 current_prompt = current_prompt.rstrip()
                                 n = tool_blk.get("name", "")
@@ -505,7 +505,7 @@ async def anthropic_messages(request: Request):
                         if acc:
                             client.account_pool.release(acc)
                             if chat_id:
-                                import asyncio
+
                                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
                         current_prompt = current_prompt.rstrip()
                         if current_prompt.endswith("Assistant:"):
@@ -543,7 +543,7 @@ async def anthropic_messages(request: Request):
                 if acc:
                     client.account_pool.release(acc)
                     if chat_id:
-                        import asyncio
+
                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
 
                 from fastapi.responses import JSONResponse
@@ -556,7 +556,7 @@ async def anthropic_messages(request: Request):
                 if acc and acc.inflight > 0:
                     client.account_pool.release(acc)
                     if chat_id:
-                        import asyncio
+
                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 if stream_attempt == max_attempts - 1:
                     raise HTTPException(status_code=500, detail=str(e))
