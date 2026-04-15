@@ -78,13 +78,20 @@ export default function AccountsPage() {
   const [verifyingAll, setVerifyingAll] = useState(false)
 
   // 邮箱+密码字段同时匹配时解锁注册功能
+  // crypto.subtle 在非安全上下文（HTTP）下不可用，需安全降级
   useEffect(() => {
     if (!email || !password) return
-    crypto.subtle.digest("SHA-256", new TextEncoder().encode(email + "::" + password))
-      .then(buf => {
-        const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("")
-        if (hex === _UH) setRegisterUnlocked(true)
-      })
+    try {
+      if (!crypto?.subtle) return
+      crypto.subtle.digest("SHA-256", new TextEncoder().encode(email + "::" + password))
+        .then(buf => {
+          const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("")
+          if (hex === _UH) setRegisterUnlocked(true)
+        })
+        .catch(() => {})
+    } catch {
+      // 非 HTTPS 环境下 crypto.subtle 可能不存在或抛异常，静默忽略
+    }
   }, [email, password])
 
   const fetchAccounts = () => {

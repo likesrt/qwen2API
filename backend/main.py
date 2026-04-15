@@ -1,11 +1,13 @@
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-import os
 
 # Windows UTF-8 输出修复
 if hasattr(sys.stdout, "reconfigure"):
@@ -93,10 +95,49 @@ async def root():
         "version": "2.0.0"
     }
 
-# 托管前端构建产物（仅当 dist 存在时，即生产打包模式）
+# SPA 前端路由兜底：对非 API、非静态资源的请求返回 index.html
+# 解决 BrowserRouter 刷新子路径时后端返回 404 的问题
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 if os.path.exists(FRONTEND_DIST):
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+    _INDEX_HTML = os.path.join(FRONTEND_DIST, "index.html")
+
+    # 需要由 FastAPI/Starlette 路由处理的 API 前缀
+    _API_PREFIXES = ("/api/", "/v1/", "/anthropic/", "/v1beta/", "/docs", "/openapi.json", "/redoc")
+
+    # 静态资源的常见文件扩展名
+    _STATIC_EXTENSIONS = (
+        ".js", ".mjs", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif",
+        ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".webmanifest",
+        ".webp", ".avif", ".json", ".xml", ".txt", ".webm", ".mp4",
+    )
+
+    # 挂载 /assets 为纯静态目录（Vite 构建产物全部在此目录下）
+    _assets_dir = os.path.join(FRONTEND_DIST, "assets")
+    if os.path.isdir(_assets_dir):
+        app.mount("/assets", StaticFiles(directory=_assets_dir), name="static_assets")
+
+    @app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def _spa_fallback(request: Request, path: str):
+        """
+        SPA 前端兜底路由：静态资源返回文件，其余路径返回 index.html。
+
+        - 带 API 前缀的路径不应走到这里（FastAPI 显式路由优先），
+          若意外到达则返回 404
+        - 静态资源文件（JS/CSS/字体/图片等）直接从 dist 目录返回
+        - 其余所有路径返回 index.html，供前端 BrowserRouter 处理
+        """
+        # API 路径不应由 fallback 处理
+        if any(request.url.path.startswith(p) for p in _API_PREFIXES):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+        # 尝试在 dist 目录中查找对应的静态文件
+        if any(path.endswith(ext) for ext in _STATIC_EXTENSIONS):
+            file_path = os.path.join(FRONTEND_DIST, path)
+            if os.path.isfile(file_path):
+                return FileResponse(file_path)
+
+        # 其他所有路径（SPA 路由）返回 index.html
+        return FileResponse(_INDEX_HTML)
 
 if __name__ == "__main__":
     import uvicorn
