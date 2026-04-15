@@ -73,7 +73,7 @@ export default function AccountsPage() {
   const [password, setPassword] = useState("")
   const [token, setToken] = useState("")
   const [registering, setRegistering] = useState(false)
-  const [registerUnlocked, setRegisterUnlocked] = useState(false)
+  const [registerUnlocked, setRegisterUnlocked] = useState(true)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
 
