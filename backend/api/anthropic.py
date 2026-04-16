@@ -9,7 +9,7 @@ from typing import Optional
 from backend.core.account_pool import Account
 from backend.services.qwen_client import QwenClient
 from backend.services.token_calc import calculate_usage
-from backend.services.prompt_builder import messages_to_prompt
+from backend.services.prompt_builder import messages_to_prompt, resolve_anthropic_reasoning_output_format
 from backend.services.tool_parser import parse_tool_calls, inject_format_reminder, build_tool_blocks_from_native_chunks, should_block_tool_call
 from backend.core.config import resolve_model, settings
 
@@ -254,6 +254,41 @@ def _has_recent_unchanged_read_result(messages) -> bool:
     return False
 
 
+def _wrap_anthropic_reasoning(content: str, reasoning_format: str) -> str:
+    """按 Anthropic 格式包装思考内容。
+
+    参数:
+        content: 原始思考文本。
+        reasoning_format: 目标格式，支持 `thinking`、`think`、`reasoning_content`。
+    返回:
+        str: 包装后的思考内容。
+    边界条件:
+        `thinking` 模式用 <thinking> 标签，`think` 用 <think> 标签，`reasoning_content` 保持纯文本。
+    """
+    if reasoning_format == "thinking":
+        return f"<thinking>{content}</thinking>"
+    if reasoning_format == "think":
+        return f"<think>{content}</think>"
+    return content
+
+
+def _build_anthropic_thinking_block(content: str, reasoning_format: str) -> dict:
+    """构造 Anthropic thinking content block。
+
+    参数:
+        content: 原始思考文本。
+        reasoning_format: 目标格式，支持 `thinking`、`think`、`reasoning_content`。
+    返回:
+        dict: 适配格式的 content block。
+    边界条件:
+        `thinking` 模式返回 `{"type": "thinking", "thinking": content}`，其余模式返回 `{"type": "text", "text": wrapped}`。
+    """
+    if reasoning_format == "thinking":
+        return {"type": "thinking", "thinking": content}
+    wrapped = _wrap_anthropic_reasoning(content, reasoning_format)
+    return {"type": "text", "text": wrapped}
+
+
 def _anthropic_sse(event: str, data: dict) -> str:
     """构造一条 Anthropic 兼容 SSE 事件。
 
@@ -319,6 +354,15 @@ async def _release_stream_account(client: QwenClient, acc: Optional[Account], ch
 @router.post("/v1/messages")
 @router.post("/anthropic/v1/messages")
 async def anthropic_messages(request: Request):
+    """处理 Anthropic 兼容消息请求。
+
+    参数:
+        request: 当前 FastAPI 请求对象。
+    返回:
+        Response: 根据 `stream` 返回 SSE 流或普通 JSON。
+    边界条件:
+        工具模式会优先保留工具调用解析；普通对话模式会直接透传流式文本分片。
+    """
     app = request.app
     users_db = app.state.users_db
     client: QwenClient = app.state.qwen_client
@@ -354,7 +398,8 @@ async def anthropic_messages(request: Request):
     model_name = req_data.get("model", "claude-3-5-sonnet")
     qwen_model = resolve_model(model_name)
     stream = req_data.get("stream", False)
-    
+    reasoning_format = resolve_anthropic_reasoning_output_format(req_data)
+
     prompt, tools = messages_to_prompt(req_data)
     log.info(f"[ANT] model={qwen_model}, stream={stream}, tools={[t.get('name') for t in tools]}, prompt_len={len(prompt)}")
 
@@ -363,6 +408,15 @@ async def anthropic_messages(request: Request):
 
     if stream:
         async def generate():
+            """按 Anthropic SSE 协议转发当前请求的流式响应。
+
+            参数:
+                无。
+            返回:
+                async generator: 连续产出兼容 Anthropic 的 SSE 事件文本。
+            边界条件:
+                普通文本响应会即时下发 answer 分片；工具模式仍保留末尾解析，避免把工具调用文本提前透传给前端。
+            """
             current_prompt = prompt
             excluded_accounts = set()
             max_attempts = settings.TOOL_MAX_RETRIES if tools else settings.MAX_RETRIES
@@ -427,12 +481,21 @@ async def anthropic_messages(request: Request):
                     content = evt.get("content", "")
                     if phase in ("think", "thinking_summary") and content:
                         reasoning_text += content
-                        if active_block != ("thinking", block_idx):
+                        block_type = "thinking" if reasoning_format == "thinking" else "text"
+                        if active_block != (block_type, block_idx):
                             for packet in ensure_message_start():
                                 yield packet
-                            yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})
-                            active_block = ("thinking", block_idx)
-                        yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': content}})
+                            if reasoning_format == "thinking":
+                                yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})
+                                active_block = ("thinking", block_idx)
+                            else:
+                                yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'text', 'text': ''}})
+                                active_block = ("text", block_idx)
+                        if reasoning_format == "thinking":
+                            yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': content}})
+                        else:
+                            wrapped = _wrap_anthropic_reasoning(content, reasoning_format)
+                            yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'text_delta', 'text': wrapped}})
                         emitted_payload = True
                     elif phase == "tool_call" and content:
                         tc_id, state, args_delta = _merge_native_tool_delta(native_tc_chunks, evt)
@@ -453,6 +516,17 @@ async def anthropic_messages(request: Request):
                                 emitted_payload = True
                     elif phase == "answer" and content:
                         answer_text += content
+                        if not tools:
+                            for packet in ensure_message_start():
+                                yield packet
+                            if active_block != ("text", block_idx):
+                                if active_block is not None:
+                                    yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
+                                    block_idx += 1
+                                yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'text', 'text': ''}})
+                                active_block = ("text", block_idx)
+                            yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'text_delta', 'text': content}})
+                            emitted_payload = True
                     if evt.get("status") == "finished" and phase == "answer":
                         break
 
@@ -461,18 +535,11 @@ async def anthropic_messages(request: Request):
                     block_idx += 1
                     active_block = None
 
-                log.info(
-                    f"[ANT-诊断] 流式轮次={stream_attempt+1}/{max_attempts} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} "
-                    f"native_tc_count={len(native_tc_chunks)} emitted_payload={emitted_payload}"
-                )
-
                 blocks, stop_reason = build_tool_blocks_from_native_chunks(native_tc_chunks, tools) if tools else ([{"type": "text", "text": answer_text}], "end_turn")
                 if not blocks or stop_reason != "tool_use":
                     blocks, stop_reason = parse_tool_calls(answer_text, tools) if tools else ([{"type": "text", "text": answer_text}], "end_turn")
 
                 blocked_names = _extract_blocked_tool_names(answer_text.strip())
-                if blocked_names:
-                    log.info(f"[ANT-诊断] 检测到上游拦截工具名 blocked_names={blocked_names} stop_reason={stop_reason} native_tc_count={len(native_tc_chunks)}")
                 if blocked_names and tools and stop_reason != "tool_use" and not emitted_payload:
                     blocked_name = blocked_names[0]
                     if native_tc_chunks:
@@ -561,11 +628,30 @@ async def anthropic_messages(request: Request):
                         await asyncio.sleep(0.15)
                         continue
 
+                if not tools and emitted_payload:
+                    blocks = []
+                if not tools and emitted_payload and not reasoning_text:
+                    yield _anthropic_sse('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': len(answer_text)}})
+                    yield _anthropic_sse('message_stop', {'type': 'message_stop'})
+
+                    users = await users_db.get()
+                    for u in users:
+                        if u["id"] == token:
+                            u["used_tokens"] += len(answer_text) + len(prompt)
+                            break
+                    await users_db.save(users)
+                    await _release_stream_account(client, acc, chat_id)
+                    return
                 for packet in ensure_message_start():
                     yield packet
                 if not emitted_payload and reasoning_text:
-                    yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})
-                    yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})
+                    if reasoning_format == "thinking":
+                        yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})
+                        yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})
+                    else:
+                        wrapped = _wrap_anthropic_reasoning(reasoning_text, reasoning_format)
+                        yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'text', 'text': ''}})
+                        yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'text_delta', 'text': wrapped}})
                     yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
                     block_idx += 1
                 for blk in blocks:
@@ -657,10 +743,6 @@ async def anthropic_messages(request: Request):
                         
                 answer_text = "".join(answer_chunks)
                 reasoning_text = "".join(thinking_chunks)
-                log.info(
-                    f"[ANT-诊断] 流式轮次={stream_attempt+1}/{max_attempts} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} "
-                    f"native_tc_count={len(native_tc_chunks)} event_count={len(events)}"
-                )
 
                 blocks, stop_reason = build_tool_blocks_from_native_chunks(native_tc_chunks, tools) if tools else ([{"type": "text", "text": answer_text}], "end_turn")
                 if blocks and stop_reason == "tool_use":
@@ -670,8 +752,6 @@ async def anthropic_messages(request: Request):
                     blocks, stop_reason = parse_tool_calls(answer_text, tools) if tools else ([{"type": "text", "text": answer_text}], "end_turn")
 
                 blocked_names = _extract_blocked_tool_names(answer_text.strip())
-                if blocked_names:
-                    log.info(f"[ANT-诊断] 检测到上游拦截工具名 blocked_names={blocked_names} stop_reason={stop_reason} native_tc_count={len(native_tc_chunks)}")
                 if blocked_names and tools and stop_reason != "tool_use":
                     blocked_name = blocked_names[0]
                     # 如果 native_tc_chunks 有数据，直接转换格式，跳过重试（省 60s）
@@ -804,7 +884,7 @@ async def anthropic_messages(request: Request):
 
                 content_blocks = []
                 if reasoning_text:
-                    content_blocks.append({"type": "thinking", "thinking": reasoning_text})
+                    content_blocks.append(_build_anthropic_thinking_block(reasoning_text, reasoning_format))
                 content_blocks.extend(blocks)
 
                 users = await users_db.get()

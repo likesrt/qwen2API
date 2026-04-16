@@ -497,6 +497,75 @@ def _extract_request_feature_config_override(req_data: dict) -> Optional[dict]:
 
 
 
+def _normalize_reasoning_output_format(value: Optional[str], default: str) -> str:
+    """把思考输出格式归一化为网关支持的固定枚举。
+
+    参数:
+        value: 请求里显式声明的输出格式。
+        default: 当前协议的默认输出格式。
+    返回:
+        str: `reasoning_content`、`thinking` 或 `think` 三者之一。
+    边界条件:
+        未识别值会回退到默认格式，避免兼容层因脏输入抛错。
+    """
+    lowered = str(value or "").strip().lower()
+    return lowered if lowered in ("reasoning_content", "thinking", "think") else default
+
+
+
+def _extract_reasoning_output_format_value(req_data: dict) -> Optional[str]:
+    """从请求体中提取显式声明的思考输出格式。
+
+    参数:
+        req_data: 下游兼容接口收到的原始请求体。
+    返回:
+        Optional[str]: 原始格式值；未声明时返回 None。
+    边界条件:
+        同时兼容顶层字段与 Anthropic `thinking` 对象里的格式声明。
+    """
+    for key in ("reasoning_format", "thinking_format", "reasoning_content_format"):
+        value = req_data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    thinking = req_data.get("thinking")
+    if not isinstance(thinking, dict):
+        return None
+    for key in ("format", "output_format", "response_format"):
+        value = thinking.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+
+def resolve_oai_reasoning_output_format(req_data: dict) -> str:
+    """解析 OpenAI 兼容接口的思考输出格式。
+
+    参数:
+        req_data: 下游兼容接口收到的原始请求体。
+    返回:
+        str: OpenAI 接口使用的思考输出格式。
+    边界条件:
+        OpenAI 默认沿用 `reasoning_content`，兼容 DeepSeek 风格客户端。
+    """
+    return _normalize_reasoning_output_format(_extract_reasoning_output_format_value(req_data), "reasoning_content")
+
+
+
+def resolve_anthropic_reasoning_output_format(req_data: dict) -> str:
+    """解析 Anthropic 兼容接口的思考输出格式。
+
+    参数:
+        req_data: 下游兼容接口收到的原始请求体。
+    返回:
+        str: Anthropic 接口使用的思考输出格式。
+    边界条件:
+        Anthropic 默认输出 `<thinking>` 标签，便于与现有客户端展示逻辑对齐。
+    """
+    return _normalize_reasoning_output_format(_extract_reasoning_output_format_value(req_data), "thinking")
+
+
+
 def messages_to_prompt(req_data: dict) -> tuple:
     """从请求体提取消息、工具与功能开关，并生成最终提示词。
 

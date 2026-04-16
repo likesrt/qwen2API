@@ -10,7 +10,7 @@ from typing import Optional
 from backend.core.account_pool import Account
 from backend.services.qwen_client import QwenClient
 from backend.services.token_calc import calculate_usage
-from backend.services.prompt_builder import messages_to_prompt
+from backend.services.prompt_builder import messages_to_prompt, resolve_oai_reasoning_output_format
 from backend.services.tool_parser import parse_tool_calls, inject_format_reminder, build_tool_blocks_from_native_chunks, should_block_tool_call
 from backend.core.config import resolve_model, settings, IMAGE_MODEL_DEFAULT
 
@@ -241,6 +241,41 @@ def _extract_image_urls(text: str) -> list[str]:
     return result
 
 
+def _wrap_reasoning_content(content: str, reasoning_format: str) -> str:
+    """按请求约定把思考文本包装成指定输出格式。
+
+    参数:
+        content: 原始思考文本。
+        reasoning_format: 目标格式，支持 `reasoning_content`、`thinking`、`think`。
+    返回:
+        str: 包装后的思考文本。
+    边界条件:
+        `reasoning_content` 模式保持纯文本，其余模式会补对应标签。
+    """
+    if reasoning_format == "thinking":
+        return f"<thinking>{content}</thinking>"
+    if reasoning_format == "think":
+        return f"<think>{content}</think>"
+    return content
+
+
+
+def _build_oai_reasoning_delta(content: str, reasoning_format: str) -> dict:
+    """为 OpenAI 兼容接口构造思考分片载荷。
+
+    参数:
+        content: 原始思考文本。
+        reasoning_format: 目标格式，支持 `reasoning_content`、`thinking`、`think`。
+    返回:
+        dict: 可直接写入 chunk 的 delta 对象。
+    边界条件:
+        标签模式会把思考文本并入 `content` 字段，避免依赖非标准扩展字段。
+    """
+    wrapped = _wrap_reasoning_content(content, reasoning_format)
+    return {"reasoning_content": wrapped} if reasoning_format == "reasoning_content" else {"content": wrapped}
+
+
+
 def _oai_chunk_payload(completion_id: str, created: int, model_name: str, delta: dict, finish: str | None = None) -> str:
     """构造一条 OpenAI 兼容的 SSE 数据块。
 
@@ -419,7 +454,8 @@ async def chat_completions(request: Request):
     model_name = req_data.get("model", "gpt-3.5-turbo")
     qwen_model = resolve_model(model_name)
     stream = req_data.get("stream", False)
-    
+    reasoning_format = resolve_oai_reasoning_output_format(req_data)
+
     prompt, tools = messages_to_prompt(req_data)
     log.info(f"[OAI] model={qwen_model}, stream={stream}, tools={[t.get('name') for t in tools]}, prompt_len={len(prompt)}")
     history_messages = req_data.get("messages", [])
@@ -518,7 +554,7 @@ async def chat_completions(request: Request):
                                 sent_role = True
                             streamed_any = True
                             # Chat Completions 官方没有标准化 reasoning_content；这里继续透传网关扩展字段，兼容 Cherry Studio 等前端展示思考块。
-                            yield _oai_chunk_payload(completion_id, created, model_name, {"reasoning_content": content})
+                            yield _oai_chunk_payload(completion_id, created, model_name, _build_oai_reasoning_delta(content, reasoning_format))
                         elif phase == "answer" and content:
                             if not sent_role:
                                 yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
@@ -588,7 +624,7 @@ async def chat_completions(request: Request):
                         if not sent_role:
                             yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
                             sent_role = True
-                        yield _oai_chunk_payload(completion_id, created, model_name, {"reasoning_content": content})
+                        yield _oai_chunk_payload(completion_id, created, model_name, _build_oai_reasoning_delta(content, reasoning_format))
                         streamed_reasoning = True
                         emitted_payload = True
                     elif phase == "tool_call" and content:
@@ -662,7 +698,7 @@ async def chat_completions(request: Request):
                 if not has_tool_call and answer_text:
                     yield _oai_chunk_payload(completion_id, created, model_name, {"content": answer_text})
                 if not has_tool_call and reasoning_text and not streamed_reasoning:
-                    yield _oai_chunk_payload(completion_id, created, model_name, {"reasoning_content": reasoning_text})
+                    yield _oai_chunk_payload(completion_id, created, model_name, _build_oai_reasoning_delta(reasoning_text, reasoning_format))
                 yield _oai_chunk_payload(completion_id, created, model_name, {}, "tool_calls" if has_tool_call else "stop")
                 yield "data: [DONE]\n\n"
 
@@ -816,7 +852,8 @@ async def chat_completions(request: Request):
                 else:
                     msg = {"role": "assistant", "content": answer_text}
                     if reasoning_text:
-                        msg["reasoning_content"] = reasoning_text
+                        reasoning_delta = _build_oai_reasoning_delta(reasoning_text, reasoning_format)
+                        msg.update(reasoning_delta)
                     finish_reason = "stop"
 
                 users = await users_db.get()

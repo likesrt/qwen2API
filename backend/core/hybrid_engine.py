@@ -2,7 +2,7 @@
 hybrid_engine.py — mix browser stability with httpx speed.
 Phase 1 policy:
 - api_call: httpx first, browser fallback on failures
-- fetch_chat: httpx first, browser fallback on failures
+- fetch_chat: browser first, httpx fallback on failures
 """
 
 import logging

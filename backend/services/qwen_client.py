@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import time
-import traceback
 import uuid
 from typing import Optional, Any
 from backend.core.account_pool import AccountPool, Account
@@ -89,28 +88,6 @@ def _parse_chat_id(body_text: str) -> str:
     return data["data"]["id"]
 
 
-def _format_delete_chat_stack() -> str:
-    """格式化 delete_chat 的调用栈，便于定位重复清理来源。
-
-    参数:
-        无。
-    返回:
-        str: 过滤当前工具函数帧后的紧凑调用栈文本。
-    边界条件:
-        当调用栈不足或格式化失败时，会返回可打印的兜底文本，避免诊断日志本身抛错。
-    """
-    try:
-        frames = traceback.extract_stack()[:-2]
-        if not frames:
-            return "<empty stack>"
-        return " | ".join(
-            f"{frame.filename}:{frame.lineno} in {frame.name}"
-            for frame in frames[-8:]
-        )
-    except Exception as exc:
-        return f"<stack format failed: {exc}>"
-
-
 class QwenClient:
     def __init__(self, engine: Any, account_pool: AccountPool):
         self.engine = engine
@@ -140,7 +117,7 @@ class QwenClient:
             raise e
 
     async def delete_chat(self, token: str, chat_id: str):
-        """删除上游会话，并记录调用来源，便于排查重复清理。
+        """删除上游会话。
 
         参数:
             token: 当前账号的上游 Bearer Token。
@@ -148,10 +125,8 @@ class QwenClient:
         返回:
             None: 仅执行删除请求，不返回额外数据。
         边界条件:
-            每次调用都会打印精简调用栈；当重复删除同一 chat 时，可直接从日志比对来源。
+            当上游会话已经失效时，底层引擎会返回对应错误，调用方按现有重试或清理流程处理。
         """
-        stack_text = _format_delete_chat_stack()
-        log.info(f"[delete_chat] 准备删除会话：chat_id={chat_id} stack={stack_text}")
         await self.engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
 
     async def verify_token(self, token: str) -> bool:
@@ -420,12 +395,22 @@ class QwenClient:
                 continue
             if evt.get("choices"):
                 delta = evt["choices"][0].get("delta", {})
+                phase = delta.get("phase", "answer")
+                content = delta.get("content", "")
+                extra = delta.get("extra", {})
+
+                # thinking_summary 的内容在 extra.summary_thought 里
+                if phase == "thinking_summary" and not content and extra:
+                    thoughts = extra.get("summary_thought", {}).get("content", [])
+                    if thoughts and isinstance(thoughts, list):
+                        content = "\n".join(str(t) for t in thoughts if t)
+
                 parsed.append({
                     "type": "delta",
-                    "phase": delta.get("phase", "answer"),
-                    "content": delta.get("content", ""),
+                    "phase": phase,
+                    "content": content,
                     "status": delta.get("status", ""),
-                    "extra": delta.get("extra", {}),
+                    "extra": extra,
                 })
                 continue
             if evt.get("phase"):

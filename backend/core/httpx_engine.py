@@ -111,14 +111,14 @@ class HttpxEngine:
                 async with client.stream("POST", url, headers=headers, data=body_bytes) as resp:
                     if resp.status_code != 200:
                         body_chunks = []
-                        async for chunk in resp.aiter_content():
+                        async for chunk in resp.aiter_content(chunk_size=8192):
                             body_chunks.append(chunk)
                         body_text = b"".join(body_chunks).decode(errors="replace")[:2000]
                         yield {"status": resp.status_code, "body": body_text}
                         return
                     decoder = codecs.getincrementaldecoder("utf-8")("replace")
                     pending = ""
-                    async for chunk in resp.aiter_content():
+                    async for chunk in resp.aiter_content(chunk_size=4096):
                         pending += decoder.decode(chunk)
                         pending = pending.replace("\r\n", "\n").replace("\r", "\n")
                         messages, pending = _split_sse_messages(pending)
