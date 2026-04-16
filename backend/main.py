@@ -20,7 +20,7 @@ if hasattr(sys.stderr, "reconfigure"):
 # 将项目根目录加入到 sys.path，解决直接运行 main.py 时找不到 backend 模块的问题
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.api import admin, anthropic, embeddings, gemini, images, probes, v1_chat, v1_models
+from backend.api import admin, anthropic, embeddings, files_api, gemini, images, models, probes, v1_chat, v1_models
 from backend.core.account_pool import AccountPool
 from backend.core.browser_engine import BrowserEngine
 from backend.core.config import settings
@@ -37,12 +37,15 @@ log = logging.getLogger("qwen2api")
 
 async def _init_storage(app: FastAPI) -> None:
     """初始化 JSON 存储和批量注册任务容器。"""
+    from backend.services.file_store import FileStore
+
     app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
     app.state.users_db = AsyncJsonDB(settings.USERS_FILE, default_data=[])
     app.state.captures_db = AsyncJsonDB(settings.CAPTURES_FILE, default_data=[])
     app.state.config_db = AsyncJsonDB(settings.CONFIG_FILE, default_data=current_runtime_config())
     app.state.register_logs_db = AsyncJsonDB(settings.REGISTER_LOG_FILE, default_data=[])
     app.state.register_tasks = {}
+    app.state.file_store = FileStore()
 
 
 async def _load_runtime_state(app: FastAPI) -> None:
@@ -103,6 +106,8 @@ app.include_router(anthropic.router, tags=["Claude Compatible"])
 app.include_router(gemini.router, tags=["Gemini Compatible"])
 app.include_router(embeddings.router, tags=["Embeddings"])
 app.include_router(probes.router, tags=["Probes"])
+app.include_router(files_api.router, tags=["Files"])
+app.include_router(models.router, tags=["Models Info"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Dashboard Admin"])
 
 
