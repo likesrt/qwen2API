@@ -37,7 +37,7 @@ log = logging.getLogger("qwen2api")
 
 async def _init_storage(app: FastAPI) -> None:
     """初始化 JSON 存储和批量注册任务容器。"""
-    from backend.services.file_store import FileStore
+    from backend.services.file_store import LocalFileStore
 
     app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
     app.state.users_db = AsyncJsonDB(settings.USERS_FILE, default_data=[])
@@ -45,7 +45,7 @@ async def _init_storage(app: FastAPI) -> None:
     app.state.config_db = AsyncJsonDB(settings.CONFIG_FILE, default_data=current_runtime_config())
     app.state.register_logs_db = AsyncJsonDB(settings.REGISTER_LOG_FILE, default_data=[])
     app.state.register_tasks = {}
-    app.state.file_store = FileStore()
+    app.state.file_store = LocalFileStore(root_dir=settings.CONTEXT_GENERATED_DIR)
 
 
 async def _load_runtime_state(app: FastAPI) -> None:
