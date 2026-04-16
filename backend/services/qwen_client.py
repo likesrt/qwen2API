@@ -297,8 +297,37 @@ class QwenClient:
                 })
         return parsed
 
+    async def _abort_active_chat(self, acc: Optional[Account], chat_id: Optional[str]) -> None:
+        """在流式任务被取消时释放账号并异步删除上游会话。
+
+        参数:
+            acc: 当前占用的账号对象。
+            chat_id: 当前上游会话 ID。
+        返回:
+            None: 仅做资源回收，不返回额外数据。
+        边界条件:
+            当会话尚未创建或账号尚未占用时，会跳过对应清理，避免取消路径再次报错。
+        """
+        if chat_id:
+            self.active_chat_ids.discard(chat_id)
+        if acc is not None and acc.inflight > 0:
+            self.account_pool.release(acc)
+        if acc is not None and chat_id:
+            asyncio.create_task(self.delete_chat(acc.token, chat_id))
+
     async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None):
-        """无感容灾重试逻辑：上游挂了自动换号"""
+        """按账号池重试流式请求，并在取消时主动回收会话资源。
+
+        参数:
+            model: 上游模型名。
+            content: 已构造好的提示词文本。
+            has_custom_tools: 当前请求是否启用了自定义工具。
+            exclude_accounts: 本轮重试需要排除的账号邮箱集合。
+        返回:
+            async generator: 先产出 meta，再持续产出解析后的 event。
+        边界条件:
+            如果下游在流式中途断开，会释放 inflight 账号并异步删除 chat，避免账号池长期占用。
+        """
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
             acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)

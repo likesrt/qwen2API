@@ -16,12 +16,72 @@ from backend.core.config import resolve_model, settings
 log = logging.getLogger("qwen2api.anthropic")
 router = APIRouter()
 
+async def _stream_events_with_cleanup(client: QwenClient, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
+    """包装上游事件流，在下游取消时主动回收账号和会话。
+
+    参数:
+        client: 当前 QwenClient 实例。
+        model: 本次请求使用的模型名。
+        prompt: 已构造完成的提示词。
+        has_custom_tools: 是否启用了工具模式。
+        exclude_accounts: 当前轮次需要排除的账号集合。
+    返回:
+        async generator: 原样转发 meta 与 event 项。
+    边界条件:
+        客户端断开会触发取消，此时会删除上游 chat 并释放 inflight 占用。
+    """
+    acc: Optional[Account] = None
+    chat_id: Optional[str] = None
+    try:
+        async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
+            if item.get("type") == "meta":
+                chat_id = item.get("chat_id")
+                meta_acc = item.get("acc")
+                if isinstance(meta_acc, Account):
+                    acc = meta_acc
+            yield item
+    except asyncio.CancelledError:
+        await client._abort_active_chat(acc, chat_id)
+        raise
+
+
+def _anthropic_error_payload(detail) -> dict:
+    """把异常详情归一化为 Anthropic 兼容 error 对象。
+
+    参数:
+        detail: 原始异常详情，可能是字符串或已有字典。
+    返回:
+        dict: 形如 `{"type": "error", "error": {...}}` 的错误对象。
+    边界条件:
+        如果 detail 已经是 Anthropic 风格 error 结构，会直接复用，避免重复包裹。
+    """
+    if isinstance(detail, dict) and detail.get("type") == "error" and isinstance(detail.get("error"), dict):
+        return detail
+    if isinstance(detail, dict) and {"type", "message"}.issubset(detail):
+        return {"type": "error", "error": detail}
+    message = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+    return {"type": "error", "error": {"type": "api_error", "message": message}}
+
+
 async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
+    """为上游事件流增加 keepalive，并在消费端断开时停止生产者。
+
+    参数:
+        client: 当前 QwenClient 实例。
+        model: 本次请求使用的模型名。
+        prompt: 已构造完成的提示词。
+        has_custom_tools: 是否启用了工具模式。
+        exclude_accounts: 当前轮次需要排除的账号集合。
+    返回:
+        async generator: 轮询队列后连续产出 item、error 或 keepalive。
+    边界条件:
+        客户端断开会取消 producer task，避免后台继续占用上游流式连接。
+    """
     queue: asyncio.Queue = asyncio.Queue()
 
     async def _producer():
         try:
-            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
+            async for item in _stream_events_with_cleanup(client, model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
                 await queue.put(("item", item))
         except Exception as e:
             await queue.put(("error", e))
@@ -506,7 +566,7 @@ async def anthropic_messages(request: Request):
                 await _release_stream_account(client, acc, chat_id)
                 return
               except HTTPException as he:
-                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': he.detail}})}\n\n"
+                yield f"event: error\ndata: {json.dumps(_anthropic_error_payload(he.detail), ensure_ascii=False)}\n\n"
                 return
               except Exception as e:
                 if acc is not None and acc.inflight > 0:
@@ -514,7 +574,7 @@ async def anthropic_messages(request: Request):
                     if chat_id:
 
                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)}})}\n\n"
+                yield f"event: error\ndata: {json.dumps(_anthropic_error_payload(str(e)), ensure_ascii=False)}\n\n"
                 return
 
         return StreamingResponse(generate(), media_type="text/event-stream",
@@ -747,5 +807,5 @@ async def anthropic_messages(request: Request):
 
                         asyncio.create_task(client.delete_chat(acc.token, chat_id))
                 if stream_attempt == max_attempts - 1:
-                    raise HTTPException(status_code=500, detail=str(e))
+                    raise HTTPException(status_code=503, detail=_anthropic_error_payload(str(e))["error"])
                 await asyncio.sleep(1)
