@@ -358,7 +358,7 @@ async def anthropic_messages(request: Request):
                                     current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                                 else:
                                     current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] ??? Unchanged since last read????? Read (attempt {stream_attempt+1}/{max_attempts})")
+                                log.warning(f"[ToolLoop-ANT] 收到 Unchanged since last read，禁止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
                                 await asyncio.sleep(0.15)
                                 continue
                             same_tool_count = _recent_same_tool_identity_count(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
@@ -606,7 +606,7 @@ async def anthropic_messages(request: Request):
                                     current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                                 else:
                                     current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] ??? Unchanged since last read????? Read (attempt {stream_attempt+1}/{max_attempts})")
+                                log.warning(f"[ToolLoop-ANT] 收到 Unchanged since last read，禁止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
                                 await asyncio.sleep(0.15)
                                 continue
                             same_tool_count = _recent_same_tool_identity_count(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))

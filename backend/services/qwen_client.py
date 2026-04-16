@@ -6,6 +6,7 @@ import uuid
 from typing import Optional, Any
 from backend.core.account_pool import AccountPool, Account
 from backend.core.config import settings
+from backend.core.proxy import proxy_manager
 from backend.services.auth_resolver import AuthResolver
 
 log = logging.getLogger("qwen2api.client")
@@ -26,6 +27,38 @@ def _is_banned_error(error_msg: str) -> bool:
     msg = error_msg.lower()
     return any(keyword in msg for keyword in BANNED_KEYWORDS)
 
+
+def _is_unauthorized_response(status: int, body_text: str) -> bool:
+    """判断创建会话响应是否属于鉴权或账号状态错误。"""
+    return (
+        status in (401, 403)
+        or "unauthorized" in body_text
+        or "forbidden" in body_text
+        or "token" in body_text
+        or "login" in body_text
+        or "401" in body_text
+        or "403" in body_text
+    )
+
+
+def _raise_create_chat_error(status: int, body_text: str) -> None:
+    """根据创建会话的 HTTP 结果抛出更具体的异常。"""
+    if _is_unauthorized_response(status, body_text.lower()):
+        raise Exception(f"unauthorized: create_chat HTTP {status}: {body_text[:100]}")
+    raise Exception(f"create_chat HTTP {status}: {body_text[:100]}")
+
+
+def _parse_chat_id(body_text: str) -> str:
+    """从创建会话响应中提取 chat_id，缺失时抛出解析异常。"""
+    try:
+        data = json.loads(body_text)
+    except Exception as exc:
+        raise Exception(f"create_chat parse error: {exc}, body={body_text[:200]}") from exc
+    if not data.get("success") or "id" not in data.get("data", {}):
+        raise Exception(f"create_chat parse error: Qwen API returned error or missing id, body={body_text[:200]}")
+    return data["data"]["id"]
+
+
 class QwenClient:
     def __init__(self, engine: Any, account_pool: AccountPool):
         self.engine = engine
@@ -34,72 +67,28 @@ class QwenClient:
         self.active_chat_ids: set[str] = set()  # 正在使用中的 chat_id，GC 不得焚烧
 
     async def create_chat(self, token: str, model: str, chat_type: str = "t2t") -> str:
+        """创建上游会话，并复用当前引擎的最优路由策略。"""
         ts = int(time.time())
         body = {"title": f"api_{ts}", "models": [model], "chat_mode": "normal",
                 "chat_type": chat_type, "timestamp": ts}
-
-        # chat 生命周期接口也优先走浏览器，更贴近真人使用路径
-        if hasattr(self.engine, "browser_engine") and getattr(self.engine, "browser_engine") is not None:
-            r = await self.engine.browser_engine.api_call("POST", "/api/v2/chats/new", token, body)
-            status = r.get("status")
-            body_text = (r.get("body") or "").lower()
-            should_fallback = (
-                status == 0
-                or status in (401, 403, 429)
-                or "waf" in body_text
-                or "<!doctype" in body_text
-                or "forbidden" in body_text
-                or "unauthorized" in body_text
-            )
-            if should_fallback:
-                preview = (r.get("body") or "")[:160].replace("\n", "\\n")
-                log.warning(f"[QwenClient] create_chat 浏览器失败，回退到默认引擎 status={status} body_preview={preview!r}")
-                r = await self.engine.api_call("POST", "/api/v2/chats/new", token, body)
-        else:
-            r = await self.engine.api_call("POST", "/api/v2/chats/new", token, body)
+        r = await self.engine.api_call("POST", "/api/v2/chats/new", token, body)
         if r["status"] == 429:
             raise Exception("429 Too Many Requests (Engine Queue Full)")
 
         body_text = r.get("body", "")
         if r["status"] != 200:
-            body_lower = body_text.lower()
-            if (r["status"] in (401, 403)
-                    or "unauthorized" in body_lower or "forbidden" in body_lower
-                    or "token" in body_lower or "login" in body_lower
-                    or "401" in body_text or "403" in body_text):
-                raise Exception(f"unauthorized: create_chat HTTP {r['status']}: {body_text[:100]}")
-            raise Exception(f"create_chat HTTP {r['status']}: {body_text[:100]}")
-
+            _raise_create_chat_error(r["status"], body_text)
         try:
-            data = json.loads(body_text)
-            if not data.get("success") or "id" not in data.get("data", {}):
-                raise Exception("Qwen API returned error or missing id")
-            return data["data"]["id"]
+            return _parse_chat_id(body_text)
         except Exception as e:
             body_lower = body_text.lower()
             if any(kw in body_lower for kw in ("html", "login", "unauthorized", "activation",
                                                 "pending", "forbidden", "token", "expired", "invalid")):
                 raise Exception(f"unauthorized: account issue: {body_text[:200]}")
-            raise Exception(f"create_chat parse error: {e}, body={body_text[:200]}")
+            raise e
 
     async def delete_chat(self, token: str, chat_id: str):
-        if hasattr(self.engine, "browser_engine") and getattr(self.engine, "browser_engine") is not None:
-            r = await self.engine.browser_engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
-            status = r.get("status")
-            body_text = (r.get("body") or "").lower()
-            should_fallback = (
-                status == 0
-                or status in (401, 403, 429)
-                or "waf" in body_text
-                or "<!doctype" in body_text
-                or "forbidden" in body_text
-                or "unauthorized" in body_text
-            )
-            if should_fallback:
-                preview = (r.get("body") or "")[:160].replace("\n", "\\n")
-                log.warning(f"[QwenClient] delete_chat 浏览器失败，回退到默认引擎 chat_id={chat_id} status={status} body_preview={preview!r}")
-                await self.engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
-            return
+        """删除上游会话，并复用当前引擎的最优路由策略。"""
         await self.engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
 
     async def verify_token(self, token: str) -> bool:
@@ -122,7 +111,7 @@ class QwenClient:
                 "Connection": "keep-alive"
             }
 
-            async with httpx.AsyncClient(timeout=15) as hc:
+            async with httpx.AsyncClient(proxy=proxy_manager.get_httpx_proxy(), timeout=15) as hc:
                 resp = await hc.get(
                     f"{BASE_URL}/api/v1/auths/",
                     headers=headers,
@@ -160,7 +149,7 @@ class QwenClient:
                 "Connection": "keep-alive"
             }
 
-            async with httpx.AsyncClient(timeout=10) as hc:
+            async with httpx.AsyncClient(proxy=proxy_manager.get_httpx_proxy(), timeout=10) as hc:
                 resp = await hc.get(
                     f"{BASE_URL}/api/models",
                     headers=headers,

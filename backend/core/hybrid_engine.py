@@ -7,11 +7,33 @@ Phase 1 policy:
 
 import logging
 
+from backend.core.proxy import proxy_manager
+
 log = logging.getLogger("qwen2api.hybrid_engine")
 
 
+def _should_fallback(status: int, body_text: str) -> bool:
+    """判断当前响应是否需要切换到另一条引擎路径。"""
+    return (
+        status == 0
+        or status in (401, 403, 429)
+        or "waf" in body_text
+        or "<!doctype" in body_text
+        or "forbidden" in body_text
+        or "unauthorized" in body_text
+    )
+
+
+def _body_preview(result: dict) -> str:
+    """提取短响应片段，便于记录回退日志。"""
+    return (result.get("body") or "")[:160].replace("\n", "\\n")
+
+
 class HybridEngine:
+    """组合浏览器与直连引擎，根据场景在两者之间切换。"""
+
     def __init__(self, browser_engine, httpx_engine):
+        """保存底层引擎实例，并暴露统一状态字段。"""
         self.browser_engine = browser_engine
         self.httpx_engine = httpx_engine
         self._started = False
@@ -20,6 +42,7 @@ class HybridEngine:
         self._pages = getattr(browser_engine, "_pages", None)
 
     async def start(self):
+        """启动两套底层引擎，并记录当前 API 路由策略。"""
         log.info("[HybridEngine] 启动开始：先启动 httpx 引擎")
         await self.httpx_engine.start()
         log.info("[HybridEngine] 第一步完成：httpx 已启动，继续启动浏览器引擎")
@@ -36,21 +59,13 @@ class HybridEngine:
         log.info("[HybridEngine] 已停止")
 
     async def api_call(self, method: str, path: str, token: str, body: dict = None) -> dict:
+        """优先使用直连引擎，失败后再回退浏览器。"""
         log.info(f"[HybridEngine] api_call 路由：优先走 httpx，method={method} path={path}")
         result = await self.httpx_engine.api_call(method, path, token, body)
         status = result.get("status")
         body_text = (result.get("body") or "").lower()
-        should_fallback = (
-            status == 0
-            or status in (401, 403, 429)
-            or "waf" in body_text
-            or "<!doctype" in body_text
-            or "forbidden" in body_text
-            or "unauthorized" in body_text
-        )
-        if should_fallback:
-            preview = (result.get("body") or "")[:160].replace("\n", "\\n")
-            log.warning(f"[HybridEngine] api_call 回退到 browser，method={method} path={path} status={status} body_preview={preview!r}")
+        if _should_fallback(status, body_text):
+            log.warning(f"[HybridEngine] api_call 回退到 browser，method={method} path={path} status={status} body_preview={_body_preview(result)!r}")
             return await self.browser_engine.api_call(method, path, token, body)
         log.info(f"[HybridEngine] api_call 实际由 httpx 完成，method={method} path={path} status={status}")
         return result
@@ -100,6 +115,7 @@ class HybridEngine:
             yield item
 
     def status(self) -> dict:
+        """返回混合引擎的当前运行状态和实际 API 路由策略。"""
         free_pages = 0
         queue = 0
         if self._pages is not None:

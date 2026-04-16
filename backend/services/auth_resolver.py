@@ -4,6 +4,7 @@ from backend.core.account_pool import AccountPool, Account
 from backend.core.browser_engine import _new_browser
 from backend.core.config import settings
 from backend.core.account_pool import Account
+from backend.core.proxy import proxy_manager
 import logging
 import asyncio
 import random
@@ -33,7 +34,7 @@ async def _verify_qwen_token(token: str) -> bool:
             "Origin": "https://chat.qwen.ai",
             "Connection": "keep-alive"
         }
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(proxy=proxy_manager.get_httpx_proxy(), timeout=15) as client:
             resp = await client.get(f"{BASE_URL}/api/v1/auths/", headers=headers)
         if resp.status_code != 200:
             return False
@@ -182,7 +183,10 @@ async def _find_verify_link_via_mail_page(email: str) -> str:
 class _EmailSession:
     def __init__(self):
         from curl_cffi import requests as cffi_requests
-        self._session = cffi_requests.Session(impersonate="chrome")
+        self._session = cffi_requests.Session(
+            impersonate="chrome",
+            proxies=proxy_manager.get_curl_cffi_proxies(),
+        )
         self._session.headers.update({
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
