@@ -142,6 +142,146 @@ def _extract_image_urls(text: str) -> list[str]:
     return result
 
 
+def _oai_chunk_payload(completion_id: str, created: int, model_name: str, delta: dict, finish: str | None = None) -> str:
+    """构造一条 OpenAI 兼容的 SSE 数据块。
+
+    参数:
+        completion_id: 当前补全请求 ID。
+        created: Unix 时间戳。
+        model_name: 下游请求声明的模型名。
+        delta: 当前这条 chunk 的增量载荷。
+        finish: 可选的结束原因。
+    返回:
+        str: 已带 `data:` 前缀和空行结尾的 SSE 文本。
+    边界条件:
+        该函数只负责序列化，不校验 delta 语义是否符合客户端期望。
+    """
+    payload = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _merge_native_tool_delta(native_tc_chunks: dict, evt: dict) -> tuple[str, dict, str]:
+    """合并一条原生 tool_call 分片，并返回本次新增的参数片段。
+
+    参数:
+        native_tc_chunks: 当前会话已收集的原生工具调用状态。
+        evt: 单条统一 delta 事件。
+    返回:
+        tuple[str, dict, str]: tool_call_id、合并后的状态、当前新增 arguments 片段。
+    边界条件:
+        当 content 不是合法 JSON 时，会把整段内容按 arguments 追加，避免参数被静默丢弃。
+    """
+    tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
+    state = native_tc_chunks.setdefault(tc_id, {"name": "", "args": ""})
+    args_delta = ""
+    try:
+        chunk = json.loads(evt.get("content", ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        args_delta = evt.get("content", "")
+    else:
+        if chunk.get("name"):
+            state["name"] = chunk["name"]
+        if chunk.get("arguments"):
+            args_delta = chunk["arguments"]
+    if args_delta:
+        state["args"] += args_delta
+    return tc_id, state, args_delta
+
+
+def _build_oai_native_tool_chunks(
+    completion_id: str,
+    created: int,
+    model_name: str,
+    tool_indexes: dict,
+    started_tools: set,
+    tc_id: str,
+    state: dict,
+    args_delta: str,
+) -> list[str]:
+    """把原生 tool_call 状态转成 OpenAI 流式 tool_calls 分片。
+
+    参数:
+        completion_id: 当前补全请求 ID。
+        created: Unix 时间戳。
+        model_name: 下游请求声明的模型名。
+        tool_indexes: tool_call_id 到下标的映射。
+        started_tools: 已经向客户端发过头部的 tool_call_id 集合。
+        tc_id: 当前工具调用 ID。
+        state: 当前工具调用的累计状态。
+        args_delta: 当前新增的 arguments 片段。
+    返回:
+        list[str]: 可直接 yield 的 SSE 文本列表。
+    边界条件:
+        当名称晚于参数到达时，会在首次拿到名称后把已缓存参数一次性补发给客户端。
+    """
+    chunks: list[str] = []
+    index = tool_indexes.setdefault(tc_id, len(tool_indexes))
+    just_started = False
+    if state.get("name") and tc_id not in started_tools:
+        chunks.append(_oai_chunk_payload(completion_id, created, model_name, {
+            "tool_calls": [{"index": index, "id": tc_id, "type": "function", "function": {"name": state["name"], "arguments": ""}}]
+        }))
+        started_tools.add(tc_id)
+        just_started = True
+    if tc_id in started_tools:
+        arguments = state.get("args", "") if just_started else args_delta
+        if arguments:
+            chunks.append(_oai_chunk_payload(completion_id, created, model_name, {
+                "tool_calls": [{"index": index, "function": {"arguments": arguments}}]
+            }))
+    return chunks
+
+
+def _build_oai_tool_use_chunks(completion_id: str, created: int, model_name: str, tool_blocks: list[dict]) -> list[str]:
+    """把完整工具调用块转换成 OpenAI 流式 tool_calls 输出。
+
+    参数:
+        completion_id: 当前补全请求 ID。
+        created: Unix 时间戳。
+        model_name: 下游请求声明的模型名。
+        tool_blocks: 已解析完成的 tool_use 块列表。
+    返回:
+        list[str]: 可直接下发给客户端的 SSE 文本列表。
+    边界条件:
+        该函数按完整参数一次性输出，适合文本解析或已完成的原生工具调用。
+    """
+    chunks: list[str] = []
+    tc_list = [b for b in tool_blocks if b.get("type") == "tool_use"]
+    for idx, tc in enumerate(tc_list):
+        chunks.append(_oai_chunk_payload(completion_id, created, model_name, {
+            "tool_calls": [{"index": idx, "id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": ""}}]
+        }))
+        chunks.append(_oai_chunk_payload(completion_id, created, model_name, {
+            "tool_calls": [{"index": idx, "function": {"arguments": json.dumps(tc.get("input", {}), ensure_ascii=False)}}]
+        }))
+    return chunks
+
+
+async def _release_stream_account(client: QwenClient, acc: Optional[Account], chat_id: Optional[str]) -> None:
+    """释放账号并异步删除会话，避免流式提前返回后残留占用。
+
+    参数:
+        client: 当前 QwenClient 实例。
+        acc: 当前占用的账号对象。
+        chat_id: 对应的上游会话 ID。
+    返回:
+        None: 仅做资源回收，不返回额外数据。
+    边界条件:
+        当账号或会话为空时会直接跳过，避免清理阶段再次抛错。
+    """
+    if acc is None:
+        return
+    client.account_pool.release(acc)
+    if chat_id:
+        aio.create_task(client.delete_chat(acc.token, chat_id))
+
+
 @router.post("/completions")
 @router.post("/chat/completions")
 @router.post("/v1/chat/completions")
@@ -312,8 +452,17 @@ async def chat_completions(request: Request):
                             aio.create_task(client.delete_chat(acc.token, chat_id))
                     return
 
-                # ── 有工具：缓冲完整响应后解析工具调用（原逻辑）──────────────
-                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
+                # ── 有工具：原生 tool_call / reasoning 先实时下发，文本回答保留到收尾判定──────────────
+                sent_role = False
+                streamed_reasoning = False
+                answer_text = ""
+                reasoning_text = ""
+                native_tc_chunks: dict = {}
+                tool_indexes: dict = {}
+                started_tools: set[str] = set()
+                emitted_payload = False
+
+                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=True, exclude_accounts=excluded_accounts):
                     if item["type"] == "keepalive":
                         yield ": keepalive\n\n"
                         continue
@@ -324,149 +473,103 @@ async def chat_completions(request: Request):
                             acc = meta_acc
                         yield ": upstream-connected\n\n"
                         continue
-                    if item["type"] == "event":
-                        events.append(item["event"])
-
-                answer_text = ""
-                reasoning_text = ""
-                native_tc_chunks: dict = {}
-                for evt in events:
-                    if evt["type"] != "delta":
+                    if item["type"] != "event":
+                        continue
+                    evt = item["event"]
+                    if evt.get("type") != "delta":
                         continue
                     phase = evt.get("phase", "")
                     content = evt.get("content", "")
                     if phase in ("think", "thinking_summary") and content:
                         reasoning_text += content
+                        if not sent_role:
+                            yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
+                            sent_role = True
+                        yield _oai_chunk_payload(completion_id, created, model_name, {"reasoning_content": content})
+                        streamed_reasoning = True
+                        emitted_payload = True
+                    elif phase == "tool_call" and content:
+                        tc_id, state, args_delta = _merge_native_tool_delta(native_tc_chunks, evt)
+                        tool_chunks = _build_oai_native_tool_chunks(completion_id, created, model_name, tool_indexes, started_tools, tc_id, state, args_delta)
+                        if tool_chunks and not sent_role:
+                            yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
+                            sent_role = True
+                        for chunk in tool_chunks:
+                            yield chunk
+                            emitted_payload = True
                     elif phase == "answer" and content:
                         answer_text += content
-                    elif phase == "tool_call" and content:
-                        tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
-                        if tc_id not in native_tc_chunks:
-                            native_tc_chunks[tc_id] = {"name": "", "args": ""}
-                        try:
-                            chunk = json.loads(content)
-                            if "name" in chunk:
-                                native_tc_chunks[tc_id]["name"] = chunk["name"]
-                            if "arguments" in chunk:
-                                native_tc_chunks[tc_id]["args"] += chunk["arguments"]
-                        except (json.JSONDecodeError, ValueError):
-                            native_tc_chunks[tc_id]["args"] += content
                     if evt.get("status") == "finished" and phase == "answer":
                         break
 
                 log.info(
                     f"[OAI-诊断] 流式轮次={stream_attempt+1}/{settings.MAX_RETRIES} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} "
-                    f"native_tc_count={len(native_tc_chunks)} event_count={len(events)}"
+                    f"native_tc_count={len(native_tc_chunks)} streamed_tool_count={len(started_tools)}"
                 )
-                if native_tc_chunks and not answer_text:
-                    log.info(f"[SSE-stream] 检测到 Qwen 原生 tool_call 事件: {list(native_tc_chunks.keys())}")
-                tool_blocks, stop = build_tool_blocks_from_native_chunks(native_tc_chunks, tools) if tools else ([], "end_turn")
-                if tool_blocks and stop == "tool_use":
-                    tool_names = [b.get("name") for b in tool_blocks if b.get("type") == "tool_use"]
-                    log.info(f"[NativePass-OAI] 直接使用原生工具调用分片，count={len(tool_blocks)} tools={tool_names}")
-                else:
+                tool_blocks, stop = build_tool_blocks_from_native_chunks(native_tc_chunks, tools)
+                if not tool_blocks or stop != "tool_use":
                     tool_blocks, stop = parse_tool_calls(answer_text, tools)
                 has_tool_call = stop == "tool_use"
-
                 blocked_names = _extract_blocked_tool_names(answer_text.strip())
-                if blocked_names:
-                    log.info(f"[OAI-诊断] 检测到上游拦截工具名 blocked_names={blocked_names} has_tool_call={has_tool_call} native_tc_count={len(native_tc_chunks)}")
-                if blocked_names and tools and not has_tool_call and stream_attempt < max_attempts - 1:
+
+                if blocked_names and not has_tool_call and not emitted_payload and stream_attempt < max_attempts - 1:
                     blocked_name = blocked_names[0]
                     if acc is not None:
-                        client.account_pool.release(acc)
-                        if chat_id:
-                            aio.create_task(client.delete_chat(acc.token, chat_id))
+                        await _release_stream_account(client, acc, chat_id)
                         excluded_accounts.add(acc.email)
+                        acc = None
+                        chat_id = None
                     log.warning(f"[NativeBlock-Stream] Qwen拦截原生工具调用 '{blocked_name}'，注入格式纠正后重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
                     current_prompt = inject_format_reminder(current_prompt, blocked_name)
                     await aio.sleep(0.15)
                     continue
 
-                if has_tool_call:
-                    first_tool = next((b for b in tool_blocks if b.get("type") == "tool_use"), None)
-                    if first_tool:
-                        blocked_tool_call, blocked_reason = should_block_tool_call(history_messages, first_tool.get("name", ""), first_tool.get("input", {}))
-                        if blocked_tool_call and stream_attempt < max_attempts - 1:
-                            if acc:
-                                client.account_pool.release(acc)
-                                if chat_id:
-                                    aio.create_task(client.delete_chat(acc.token, chat_id))
-                            current_prompt = current_prompt.rstrip()
-                            force_text = (
-                                f"[MANDATORY NEXT STEP]: {blocked_reason}. "
-                                f"Do NOT call the same tool with the same arguments again. "
-                                f"Choose another tool or provide final answer."
-                            )
-                            if current_prompt.endswith("Assistant:"):
-                                current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
-                            else:
-                                current_prompt += "\n\n" + force_text + "\nAssistant:"
-                            log.warning(f"[ToolLoop-OAI] 阻止重复工具调用：tool={first_tool.get('name')} reason={blocked_reason} (attempt {stream_attempt+1}/{max_attempts})")
-                            await aio.sleep(0.15)
-                            continue
-                    if (first_tool and first_tool.get("name") == "Read"
-                            and _has_recent_unchanged_read_result(history_messages)
-                            and stream_attempt < max_attempts - 1):
-                        if acc:
-                            client.account_pool.release(acc)
-                            if chat_id:
-                                aio.create_task(client.delete_chat(acc.token, chat_id))
+                first_tool = next((b for b in tool_blocks if b.get("type") == "tool_use"), None) if has_tool_call else None
+                if first_tool and not emitted_payload:
+                    blocked_tool_call, blocked_reason = should_block_tool_call(history_messages, first_tool.get("name", ""), first_tool.get("input", {}))
+                    if blocked_tool_call and stream_attempt < max_attempts - 1:
+                        if acc is not None:
+                            await _release_stream_account(client, acc, chat_id)
+                            acc = None
+                            chat_id = None
                         current_prompt = current_prompt.rstrip()
-                        force_text = (
-                            "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. "
-                            "Do NOT call Read again on the same target. "
-                            "Choose another tool now."
-                        )
-                        if current_prompt.endswith("Assistant:"):
-                            current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
-                        else:
-                            current_prompt += "\n\n" + force_text + "\nAssistant:"
+                        force_text = f"[MANDATORY NEXT STEP]: {blocked_reason}. Do NOT call the same tool with the same arguments again. Choose another tool or provide final answer."
+                        current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:" if current_prompt.endswith("Assistant:") else current_prompt + "\n\n" + force_text + "\nAssistant:"
+                        log.warning(f"[ToolLoop-OAI] 阻止重复工具调用：tool={first_tool.get('name')} reason={blocked_reason} (attempt {stream_attempt+1}/{max_attempts})")
+                        await aio.sleep(0.15)
+                        continue
+                    if first_tool.get("name") == "Read" and _has_recent_unchanged_read_result(history_messages) and stream_attempt < max_attempts - 1:
+                        if acc is not None:
+                            await _release_stream_account(client, acc, chat_id)
+                            acc = None
+                            chat_id = None
+                        current_prompt = current_prompt.rstrip()
+                        force_text = "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. Do NOT call Read again on the same target. Choose another tool now."
+                        current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:" if current_prompt.endswith("Assistant:") else current_prompt + "\n\n" + force_text + "\nAssistant:"
                         log.warning(f"[ToolLoop-OAI] 检测到 Unchanged since last read，立即阻止重复 Read (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
                         await aio.sleep(0.15)
                         continue
 
-                mk = lambda delta, finish=None: json.dumps({
-                    "id": completion_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_name,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
-                }, ensure_ascii=False)
-
-                # Role chunk
-                yield f"data: {mk({'role': 'assistant'})}\n\n"
-
-                if has_tool_call:
-                    # Emit tool_calls chunks (OpenAI streaming format)
-                    tc_list = [b for b in tool_blocks if b["type"] == "tool_use"]
-                    for idx, tc in enumerate(tc_list):
-                        # Function name chunk
-                        yield f"data: {mk({'tool_calls': [{'index': idx, 'id': tc['id'], 'type': 'function', 'function': {'name': tc['name'], 'arguments': ''}}]})}\n\n"
-                        # Arguments chunk
-                        yield f"data: {mk({'tool_calls': [{'index': idx, 'function': {'arguments': json.dumps(tc.get('input', {}), ensure_ascii=False)}}]})}\n\n"
-                    yield f"data: {mk({}, 'tool_calls')}\n\n"
-                else:
-                    # Thinking chunks
-                    if reasoning_text:
-                        yield f"data: {mk({'reasoning_content': reasoning_text})}\n\n"
-                    # Content chunks
-                    if answer_text:
-                        yield f"data: {mk({'content': answer_text})}\n\n"
-                    yield f"data: {mk({}, 'stop')}\n\n"
-
+                if not sent_role:
+                    yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
+                    sent_role = True
+                if has_tool_call and not started_tools:
+                    for chunk in _build_oai_tool_use_chunks(completion_id, created, model_name, tool_blocks):
+                        yield chunk
+                if not has_tool_call and answer_text:
+                    yield _oai_chunk_payload(completion_id, created, model_name, {"content": answer_text})
+                if not has_tool_call and reasoning_text and not streamed_reasoning:
+                    yield _oai_chunk_payload(completion_id, created, model_name, {"reasoning_content": reasoning_text})
+                yield _oai_chunk_payload(completion_id, created, model_name, {}, "tool_calls" if has_tool_call else "stop")
                 yield "data: [DONE]\n\n"
-                
+
                 users = await users_db.get()
                 for u in users:
                     if u["id"] == token:
                         u["used_tokens"] += len(answer_text) + len(prompt)
                         break
                 await users_db.save(users)
-                
-                if acc:
-                    client.account_pool.release(acc)
-                    if chat_id:
-                        import asyncio
-                        aio.create_task(client.delete_chat(acc.token, chat_id))
+                await _release_stream_account(client, acc, chat_id)
                 return  # success — exit the retry loop
               except HTTPException as he:
                 yield f"data: {json.dumps({'error': he.detail})}\n\n"

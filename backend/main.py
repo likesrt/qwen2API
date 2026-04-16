@@ -65,7 +65,7 @@ async def _start_gateway(app: FastAPI) -> None:
     if settings.ENGINE_MODE == "httpx":
         log.info("引擎模式: httpx 直连")
     elif settings.ENGINE_MODE == "hybrid":
-        log.info("引擎模式: Hybrid (api_call=httpx优先, fetch_chat=browser)")
+        log.info("引擎模式: Hybrid (api_call=httpx优先, fetch_chat=httpx优先)")
     else:
         log.info("引擎模式: Camoufox 浏览器")
 

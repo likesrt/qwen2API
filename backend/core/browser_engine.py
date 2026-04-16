@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import uuid
 from contextlib import asynccontextmanager
 
 from backend.core.config import settings
@@ -29,30 +30,37 @@ JS_FETCH = (
     "}"
 )
 
-JS_STREAM_FULL = (
+JS_STREAM_POLL = (
     "async (args) => {"
     "const ctrl=new AbortController();"
     "const tmr=setTimeout(()=>ctrl.abort(),1800000);"
+    "const store=(window.__qwenStreamState=window.__qwenStreamState||{});"
+    "const state=store[args.scriptName]||{status:0,queue:[],done:false,error:'',started:false};"
+    "store[args.scriptName]=state;"
     "try{"
     "const res=await fetch(args.url,{method:'POST',"
-    "headers:{'Content-Type':'application/json','Authorization':'Bearer '+args.token},"
+    "headers:{'Content-Type':'application/json','Authorization':'Bearer '+args.token,'Accept':'text/event-stream'},"
     "body:JSON.stringify(args.payload),signal:ctrl.signal});"
-    "if(!res.ok){"
-    "const t=await res.text();clearTimeout(tmr);"
-    "return{status:res.status,body:t.substring(0,2000)};}"
+    "state.status=res.status;state.started=true;"
+    "if(!res.ok){state.error=(await res.text()).substring(0,2000);state.done=true;clearTimeout(tmr);return state;}"
     "const rdr=res.body.getReader();"
     "const dec=new TextDecoder();"
-    "let body='';"
+    "let pending='';"
     "while(true){"
     "const{done,value}=await rdr.read();"
     "if(done)break;"
-    "body+=dec.decode(value,{stream:true});}"
-    "clearTimeout(tmr);"
-    "return{status:res.status,body:body};"
+    "pending+=dec.decode(value,{stream:true}).replace(/\r\n/g,'\n').replace(/\r/g,'\n');"
+    "let idx=pending.indexOf('\n\n');"
+    "while(idx!==-1){state.queue.push(pending.slice(0,idx)+'\n\n');pending=pending.slice(idx+2);idx=pending.indexOf('\n\n');}"
+    "}"
+    "pending+=dec.decode();"
+    "pending=pending.replace(/\r\n/g,'\n').replace(/\r/g,'\n');"
+    "if(pending)state.queue.push(pending);"
+    "state.done=true;clearTimeout(tmr);return state;"
     "}catch(e){"
-    "clearTimeout(tmr);"
-    "return{status:0,body:'JS error: '+e.message};"
-    "}}"
+    "state.error='JS error: '+e.message;state.done=true;clearTimeout(tmr);return state;"
+    "}"
+    "}"
 )
 
 _CAMOUFOX_OPTS = {
@@ -85,6 +93,17 @@ def _should_retry_browser_api(result: dict) -> bool:
     """判断浏览器 API 调用结果是否适合立即换页重试。"""
     body = str(result.get("body") or "")
     return result.get("status") == 0 and ("NetworkError" in body or body.startswith("JS error:"))
+
+
+def _stream_script_name() -> str:
+    """生成一次性页面脚本名，避免并发流请求之间互相覆盖。
+
+    返回:
+        str: 当前流请求专属的脚本标识。
+    副作用:
+        名称只在单次 fetch_chat 生命周期内使用，不写入持久状态。
+    """
+    return f"qwen_stream_{uuid.uuid4().hex}"
 
 
 @asynccontextmanager
@@ -238,8 +257,112 @@ class BrowserEngine:
         finally:
             self._pages.put_nowait(retry_page)
 
+    async def _start_page_stream(self, page, script_name: str, url: str, token: str, payload: dict) -> None:
+        """在页面里启动后台流请求，并把结果写入共享状态。
+
+        参数:
+            page: 当前占用的浏览器页面实例。
+            script_name: 本次流请求对应的唯一状态键。
+            url: 上游聊天接口地址。
+            token: 上游账号 Bearer Token。
+            payload: 发送给上游的聊天请求体。
+        返回:
+            None: 页面端后台任务启动成功后立即返回。
+        副作用:
+            会在页面全局对象 `window.__qwenStreamState` 中创建本次流请求的状态槽位。
+        """
+        await page.evaluate(
+            """async (args) => {
+                window.__qwenStreamState = window.__qwenStreamState || {};
+                const task = async () => { await (%s)(args); };
+                task();
+            }""" % JS_STREAM_POLL,
+            {"url": url, "token": token, "payload": payload, "scriptName": script_name},
+        )
+
+    async def _read_page_stream_state(self, page, script_name: str) -> dict:
+        """读取页面端当前流状态，并清空已经取走的待发送队列。
+
+        参数:
+            page: 当前占用的浏览器页面实例。
+            script_name: 本次流请求对应的唯一状态键。
+        返回:
+            dict: 包含 status、queue、done、error 的当前快照。
+        边界条件:
+            如果页面里的状态槽位意外丢失，会返回 `stream state missing` 供上层判定失败。
+        """
+        return await asyncio.wait_for(
+            page.evaluate(
+                """(name) => {
+                    const store = window.__qwenStreamState || {};
+                    const state = store[name];
+                    if (!state) return {status: 0, queue: [], done: true, error: 'stream state missing'};
+                    const queue = Array.isArray(state.queue) ? state.queue.splice(0, state.queue.length) : [];
+                    return {status: state.status || 0, queue, done: Boolean(state.done), error: state.error || ''};
+                }""",
+                script_name,
+            ),
+            timeout=30,
+        )
+
+    async def _poll_page_stream(self, page, script_name: str):
+        """轮询页面流状态，并逐条产出已经闭合的 SSE 事件。
+
+        参数:
+            page: 当前占用的浏览器页面实例。
+            script_name: 本次流请求对应的唯一状态键。
+        返回:
+            async generator: 连续产出 `streamed` 分片或错误对象。
+        边界条件:
+            当页面端已经发送过部分内容后又报错时，也会把错误继续向上抛，避免客户端只看到静默截断。
+        """
+        sent_any = False
+        while True:
+            state = await self._read_page_stream_state(page, script_name)
+            if not isinstance(state, dict):
+                yield {"status": 0, "body": str(state)}
+                return
+            for message in state.get("queue", []):
+                sent_any = True
+                yield {"status": "streamed", "chunk": message}
+            if state.get("done"):
+                if state.get("status") and state.get("status") != 200 and not sent_any:
+                    yield {"status": state.get("status"), "body": state.get("error") or "Browser stream request failed"}
+                    return
+                if state.get("error"):
+                    yield {"status": 0, "body": state.get("error")}
+                return
+            await asyncio.sleep(0.05)
+
+    async def _clear_page_stream_state(self, page, script_name: str) -> None:
+        """清理页面上的临时流状态，避免后续请求误读旧数据。
+
+        参数:
+            page: 当前占用的浏览器页面实例。
+            script_name: 本次流请求对应的唯一状态键。
+        返回:
+            None: 清理完成后不返回额外数据。
+        副作用:
+            会删除页面全局对象 `window.__qwenStreamState` 下对应的临时槽位。
+        """
+        try:
+            await page.evaluate("""(name) => { if (window.__qwenStreamState) delete window.__qwenStreamState[name]; }""", script_name)
+        except Exception:
+            pass
+
     async def fetch_chat(self, token: str, chat_id: str, payload: dict, buffered: bool = False):
-        """通过浏览器页面执行聊天流式请求，并一次性返回完整 SSE 文本。"""
+        """通过浏览器页面执行聊天流式请求，并实时返回已经闭合的 SSE 事件。
+
+        参数:
+            token: 上游账号 Bearer Token。
+            chat_id: 已创建的上游会话 ID。
+            payload: 发送给上游的聊天请求体。
+            buffered: 兼容旧接口的保留参数，当前始终按流式处理。
+        返回:
+            async generator: 连续产出 `streamed` 分片或错误对象。
+        边界条件:
+            页面流在输出过部分内容后若异常结束，会继续向上报告错误，避免客户端把半截内容当成正常完成。
+        """
         await asyncio.wait_for(self._ready.wait(), timeout=300)
         if not self._started:
             yield {"status": 0, "body": "Browser engine failed to start"}
@@ -250,13 +373,15 @@ class BrowserEngine:
             yield {"status": 429, "body": "Too Many Requests (Queue full)"}
             return
         needs_refresh = False
+        script_name = _stream_script_name()
         url = f"/api/v2/chat/completions?chat_id={chat_id}"
         try:
             await asyncio.sleep(_request_jitter_seconds())
-            result = await asyncio.wait_for(page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload}), timeout=1800)
-            if isinstance(result, dict) and result.get("status") == 0:
-                needs_refresh = True
-            yield result if isinstance(result, dict) else {"status": 0, "body": str(result)}
+            await self._start_page_stream(page, script_name, url, token, payload)
+            async for item in self._poll_page_stream(page, script_name):
+                if item.get("status") == 0:
+                    needs_refresh = True
+                yield item
         except asyncio.TimeoutError:
             needs_refresh = True
             yield {"status": 0, "body": "Timeout"}
@@ -264,6 +389,7 @@ class BrowserEngine:
             needs_refresh = True
             yield {"status": 0, "body": str(exc)}
         finally:
+            await self._clear_page_stream_state(page, script_name)
             if needs_refresh:
                 asyncio.create_task(self._refresh_page_and_return(page))
             else:

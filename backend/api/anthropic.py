@@ -167,6 +167,68 @@ def _has_recent_unchanged_read_result(messages) -> bool:
             break
     return False
 
+
+def _anthropic_sse(event: str, data: dict) -> str:
+    """构造一条 Anthropic 兼容 SSE 事件。
+
+    参数:
+        event: SSE 的 event 名称。
+        data: 该事件对应的 JSON 负载。
+    返回:
+        str: 带 `event:` 与 `data:` 的完整 SSE 文本。
+    边界条件:
+        该函数只做序列化，不校验事件顺序是否符合 Anthropic 协议。
+    """
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _merge_native_tool_delta(native_tc_chunks: dict, evt: dict) -> tuple[str, dict, str]:
+    """合并一条原生 tool_call 分片，并返回本次新增参数。
+
+    参数:
+        native_tc_chunks: 当前会话已收集的原生工具调用状态。
+        evt: 单条统一 delta 事件。
+    返回:
+        tuple[str, dict, str]: tool_call_id、合并后的状态、当前新增 arguments 片段。
+    边界条件:
+        当 content 不是合法 JSON 时，会把原始文本直接拼到 arguments，避免参数丢失。
+    """
+    tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
+    state = native_tc_chunks.setdefault(tc_id, {"name": "", "args": ""})
+    args_delta = ""
+    try:
+        chunk = json.loads(evt.get("content", ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        args_delta = evt.get("content", "")
+    else:
+        if chunk.get("name"):
+            state["name"] = chunk["name"]
+        if chunk.get("arguments"):
+            args_delta = chunk["arguments"]
+    if args_delta:
+        state["args"] += args_delta
+    return tc_id, state, args_delta
+
+
+async def _release_stream_account(client: QwenClient, acc: Optional[Account], chat_id: Optional[str]) -> None:
+    """释放账号并异步删除会话，避免流式阶段残留占用。
+
+    参数:
+        client: 当前 QwenClient 实例。
+        acc: 当前占用的账号对象。
+        chat_id: 对应的上游会话 ID。
+    返回:
+        None: 仅做资源回收，不返回额外数据。
+    边界条件:
+        当账号或会话为空时会直接跳过，避免清理阶段再次抛错。
+    """
+    if acc is None:
+        return
+    client.account_pool.release(acc)
+    if chat_id:
+        asyncio.create_task(client.delete_chat(acc.token, chat_id))
+
+
 @router.post("/messages")
 @router.post("/v1/messages")
 @router.post("/anthropic/v1/messages")
@@ -224,6 +286,41 @@ async def anthropic_messages(request: Request):
                 chat_id: Optional[str] = None
                 acc: Optional[Account] = None
 
+                sent_message_start = False
+                active_block = None
+                block_idx = 0
+                answer_text = ""
+                reasoning_text = ""
+                native_tc_chunks: dict = {}
+                emitted_payload = False
+
+                def ensure_message_start() -> list[str]:
+                    """在首次内容分片前生成 message_start 数据包。
+
+                    参数:
+                        无。
+                    返回:
+                        list[str]: 需要立即发送的 SSE 文本列表，通常为 0 或 1 条。
+                    边界条件:
+                        多次调用只会在第一次返回 message_start，避免重复起包。
+                    """
+                    nonlocal sent_message_start
+                    if sent_message_start:
+                        return []
+                    sent_message_start = True
+                    return [_anthropic_sse('message_start', {
+                        'type': 'message_start',
+                        'message': {
+                            'id': msg_id,
+                            'type': 'message',
+                            'role': 'assistant',
+                            'content': [],
+                            'model': model_name,
+                            'stop_reason': None,
+                            'usage': {'input_tokens': len(current_prompt), 'output_tokens': 0},
+                        },
+                    })]
+
                 async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
                     if item["type"] == "keepalive":
                         yield ": keepalive\n\n"
@@ -235,56 +332,63 @@ async def anthropic_messages(request: Request):
                             acc = meta_acc
                         yield ": upstream-connected\n\n"
                         continue
-                    if item["type"] == "event":
-                        events.append(item["event"])
-
-                answer_chunks = []
-                thinking_chunks = []
-                native_tc_chunks = {}
-                for evt in events:
-                    if evt["type"] != "delta":
+                    if item["type"] != "event":
+                        continue
+                    evt = item["event"]
+                    if evt.get("type") != "delta":
                         continue
                     phase = evt.get("phase", "")
                     content = evt.get("content", "")
                     if phase in ("think", "thinking_summary") and content:
-                        thinking_chunks.append(content)
-                    elif phase == "answer" and content:
-                        answer_chunks.append(content)
+                        reasoning_text += content
+                        if active_block != ("thinking", block_idx):
+                            for packet in ensure_message_start():
+                                yield packet
+                            yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})
+                            active_block = ("thinking", block_idx)
+                        yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': content}})
+                        emitted_payload = True
                     elif phase == "tool_call" and content:
-                        tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
-                        if tc_id not in native_tc_chunks:
-                            native_tc_chunks[tc_id] = {"name": "", "args": ""}
-                        try:
-                            chunk = json.loads(content)
-                            if "name" in chunk:
-                                native_tc_chunks[tc_id]["name"] = chunk["name"]
-                            if "arguments" in chunk:
-                                native_tc_chunks[tc_id]["args"] += chunk["arguments"]
-                        except (json.JSONDecodeError, ValueError):
-                            native_tc_chunks[tc_id]["args"] += content
+                        tc_id, state, args_delta = _merge_native_tool_delta(native_tc_chunks, evt)
+                        just_started = False
+                        if state.get("name") and active_block != (tc_id, block_idx):
+                            if active_block is not None:
+                                yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
+                                block_idx += 1
+                            for packet in ensure_message_start():
+                                yield packet
+                            yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': state['name'], 'input': {}}})
+                            active_block = (tc_id, block_idx)
+                            just_started = True
+                        if active_block == (tc_id, block_idx) and state.get("args"):
+                            partial_json = state.get("args", "") if just_started else args_delta
+                            if partial_json:
+                                yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': partial_json}})
+                                emitted_payload = True
+                    elif phase == "answer" and content:
+                        answer_text += content
                     if evt.get("status") == "finished" and phase == "answer":
                         break
-                        
-                answer_text = "".join(answer_chunks)
-                reasoning_text = "".join(thinking_chunks)
+
+                if active_block is not None:
+                    yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
+                    block_idx += 1
+                    active_block = None
+
                 log.info(
                     f"[ANT-诊断] 流式轮次={stream_attempt+1}/{max_attempts} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} "
-                    f"native_tc_count={len(native_tc_chunks)} event_count={len(events)}"
+                    f"native_tc_count={len(native_tc_chunks)} emitted_payload={emitted_payload}"
                 )
 
                 blocks, stop_reason = build_tool_blocks_from_native_chunks(native_tc_chunks, tools) if tools else ([{"type": "text", "text": answer_text}], "end_turn")
-                if blocks and stop_reason == "tool_use":
-                    tool_names = [b.get("name") for b in blocks if b.get("type") == "tool_use"]
-                    log.info(f"[NativePass-ANT] 直接使用原生工具调用分片，count={len(blocks)} tools={tool_names}")
-                else:
+                if not blocks or stop_reason != "tool_use":
                     blocks, stop_reason = parse_tool_calls(answer_text, tools) if tools else ([{"type": "text", "text": answer_text}], "end_turn")
 
                 blocked_names = _extract_blocked_tool_names(answer_text.strip())
                 if blocked_names:
                     log.info(f"[ANT-诊断] 检测到上游拦截工具名 blocked_names={blocked_names} stop_reason={stop_reason} native_tc_count={len(native_tc_chunks)}")
-                if blocked_names and tools and stop_reason != "tool_use":
+                if blocked_names and tools and stop_reason != "tool_use" and not emitted_payload:
                     blocked_name = blocked_names[0]
-                    # 如果 native_tc_chunks 有数据，直接转换格式，跳过重试（省 60s）
                     if native_tc_chunks:
                         tc = list(native_tc_chunks.values())[0]
                         tc_name = tc.get("name", blocked_name)
@@ -293,160 +397,113 @@ async def anthropic_messages(request: Request):
                         except Exception:
                             tc_inp = {}
                         answer_text = f'##TOOL_CALL##\n{{"name": {json.dumps(tc_name)}, "input": {json.dumps(tc_inp, ensure_ascii=True)}}}\n##END_CALL##'
+                        blocks, stop_reason = parse_tool_calls(answer_text, tools)
                         log.info(f"[NativeBlock-ANT] 直接转换原生调用 '{tc_name}' → ##TOOL_CALL## 格式，跳过重试")
-                        blocked_names = []
                     else:
                         parsed_tc = _parse_native_call_from_answer(answer_text, blocked_name)
                         if parsed_tc:
                             answer_text = f'##TOOL_CALL##\n{{"name": {json.dumps(parsed_tc["name"])}, "input": {json.dumps(parsed_tc["input"], ensure_ascii=True)}}}\n##END_CALL##'
+                            blocks, stop_reason = parse_tool_calls(answer_text, tools)
                             log.info(f"[NativeBlock-ANT] 从answer文本提取调用 '{parsed_tc['name']}' → ##TOOL_CALL##，跳过重试")
-                            blocked_names = []
                         elif stream_attempt < max_attempts - 1:
                             if acc is not None:
-                                client.account_pool.release(acc)
-                                if chat_id:
-                                    asyncio.create_task(client.delete_chat(acc.token, chat_id))
+                                await _release_stream_account(client, acc, chat_id)
                                 excluded_accounts.add(acc.email)
+                                acc = None
+                                chat_id = None
                             log.warning(f"[NativeBlock-ANT] Qwen拦截了工具 '{blocked_name}' 的原生调用，注入格式纠正后重试 (attempt {stream_attempt+1}/{max_attempts})")
                             current_prompt = inject_format_reminder(current_prompt, blocked_name)
                             await asyncio.sleep(0.15)
                             continue
 
-                if tools:
-                    if stop_reason != "tool_use" and reasoning_text:
-                        rb, rs = parse_tool_calls(reasoning_text, tools)
-                        if rs == "tool_use":
-                            blocks, stop_reason = rb, rs
-                            log.info("[ToolParse-ANT] 从 thinking 回退提取到工具调用")
-                    if stop_reason == "tool_use":
-                        tool_blk = next((b for b in blocks if b.get("type") == "tool_use"), None)
-                        if tool_blk:
-                            blocked_tool_call, blocked_reason = should_block_tool_call(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
-                            if blocked_tool_call and stream_attempt < max_attempts - 1:
-                                if acc:
-                                    client.account_pool.release(acc)
-                                    if chat_id:
+                if tools and stop_reason != "tool_use" and reasoning_text and not emitted_payload:
+                    rb, rs = parse_tool_calls(reasoning_text, tools)
+                    if rs == "tool_use":
+                        blocks, stop_reason = rb, rs
+                        log.info("[ToolParse-ANT] 从 thinking 回退提取到工具调用")
 
-                                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                                current_prompt = current_prompt.rstrip()
-                                force_text = (
-                                    f"[MANDATORY NEXT STEP]: {blocked_reason}. "
-                                    f"Do NOT call the same tool with the same arguments again. "
-                                    f"Either choose a different tool or provide final answer."
-                                )
-                                if current_prompt.endswith("Assistant:"):
-                                    current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
-                                else:
-                                    current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 阻止重复工具调用：tool={tool_blk.get('name')} reason={blocked_reason} (attempt {stream_attempt+1}/{max_attempts})")
-                                await asyncio.sleep(0.15)
-                                continue
-                            recent_unchanged = _has_recent_unchanged_read_result(history_messages)
-                            if tool_blk.get("name") == "Read" and recent_unchanged and stream_attempt < max_attempts - 1:
-                                if acc:
-                                    client.account_pool.release(acc)
-                                    if chat_id:
-
-                                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                                current_prompt = current_prompt.rstrip()
-                                force_text = (
-                                    "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. "
-                                    "Do NOT call Read again on the same target. "
-                                    "Either choose a different tool (Glob/Grep) or provide final answer."
-                                )
-                                if current_prompt.endswith("Assistant:"):
-                                    current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
-                                else:
-                                    current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 收到 Unchanged since last read，禁止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
-                                await asyncio.sleep(0.15)
-                                continue
-                            same_tool_count = _recent_same_tool_identity_count(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
-                            if tool_blk.get("name") != "Read" and same_tool_count >= 2 and stream_attempt < max_attempts - 1:
-                                if acc:
-                                    client.account_pool.release(acc)
-                                    if chat_id:
-
-                                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
-                                current_prompt = current_prompt.rstrip()
-                                n = tool_blk.get("name", "")
-                                force_text = (
-                                    f"[MANDATORY NEXT STEP]: You have already called '{n}' at least 2 consecutive turns. "
-                                    f"Now you MUST choose a different tool from the list. "
-                                    f"Do not call '{n}' again this turn. "
-                                    f"Output exactly one ##TOOL_CALL## block."
-                                )
-                                if current_prompt.endswith("Assistant:"):
-                                    current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
-                                else:
-                                    current_prompt += "\n\n" + force_text + "\nAssistant:"
-                                log.warning(f"[ToolLoop-ANT] 工具 {n} 连续调用≥2次，强制切换工具 (attempt {stream_attempt+1}/{max_attempts})")
-                                await asyncio.sleep(0.15)
-                                continue
-                    if stop_reason != "tool_use" and not answer_text.strip() and stream_attempt < max_attempts - 1:
-                        if acc:
-                            client.account_pool.release(acc)
-                            if chat_id:
-
-                                asyncio.create_task(client.delete_chat(acc.token, chat_id))
+                if tools and stop_reason == "tool_use" and not emitted_payload:
+                    tool_blk = next((b for b in blocks if b.get("type") == "tool_use"), None)
+                    if tool_blk:
+                        blocked_tool_call, blocked_reason = should_block_tool_call(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
+                        if blocked_tool_call and stream_attempt < max_attempts - 1:
+                            if acc is not None:
+                                await _release_stream_account(client, acc, chat_id)
+                                acc = None
+                                chat_id = None
+                            current_prompt = current_prompt.rstrip()
+                            force_text = f"[MANDATORY NEXT STEP]: {blocked_reason}. Do NOT call the same tool with the same arguments again. Either choose a different tool or provide final answer."
+                            current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:" if current_prompt.endswith("Assistant:") else current_prompt + "\n\n" + force_text + "\nAssistant:"
+                            log.warning(f"[ToolLoop-ANT] 阻止重复工具调用：tool={tool_blk.get('name')} reason={blocked_reason} (attempt {stream_attempt+1}/{max_attempts})")
+                            await asyncio.sleep(0.15)
+                            continue
+                        recent_unchanged = _has_recent_unchanged_read_result(history_messages)
+                        if tool_blk.get("name") == "Read" and recent_unchanged and stream_attempt < max_attempts - 1:
+                            if acc is not None:
+                                await _release_stream_account(client, acc, chat_id)
+                                acc = None
+                                chat_id = None
+                            current_prompt = current_prompt.rstrip()
+                            force_text = "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. Do NOT call Read again on the same target. Either choose a different tool (Glob/Grep) or provide final answer."
+                            current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:" if current_prompt.endswith("Assistant:") else current_prompt + "\n\n" + force_text + "\nAssistant:"
+                            log.warning(f"[ToolLoop-ANT] 收到 Unchanged since last read，禁止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
+                            await asyncio.sleep(0.15)
+                            continue
+                        same_tool_count = _recent_same_tool_identity_count(history_messages, tool_blk.get("name", ""), tool_blk.get("input", {}))
+                        if tool_blk.get("name") != "Read" and same_tool_count >= 2 and stream_attempt < max_attempts - 1:
+                            if acc is not None:
+                                await _release_stream_account(client, acc, chat_id)
+                                excluded_accounts.add(acc.email)
+                                acc = None
+                                chat_id = None
+                            current_prompt = current_prompt.rstrip()
+                            n = tool_blk.get("name", "")
+                            force_text = f"[MANDATORY NEXT STEP]: You have already called '{n}' at least 2 consecutive turns. Now you MUST choose a different tool from the list. Do not call '{n}' again this turn. Output exactly one ##TOOL_CALL## block."
+                            current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:" if current_prompt.endswith("Assistant:") else current_prompt + "\n\n" + force_text + "\nAssistant:"
+                            log.warning(f"[ToolLoop-ANT] 工具 {n} 连续调用≥2次，强制切换工具 (attempt {stream_attempt+1}/{max_attempts})")
+                            await asyncio.sleep(0.15)
+                            continue
+                    elif stream_attempt < max_attempts - 1:
+                        if acc is not None:
+                            await _release_stream_account(client, acc, chat_id)
+                            acc = None
+                            chat_id = None
                         current_prompt = current_prompt.rstrip()
-                        if current_prompt.endswith("Assistant:"):
-                            current_prompt = (
-                                current_prompt[:-len("Assistant:")]
-                                + "[MANDATORY NEXT STEP]: You MUST output exactly one ##TOOL_CALL## block now. "
-                                  "Choose the best tool from the provided list by yourself. "
-                                  "Do not answer in plain text.\nAssistant:"
-                            )
-                        else:
-                            current_prompt += (
-                                "\n\n[MANDATORY NEXT STEP]: You MUST output exactly one ##TOOL_CALL## block now. "
-                                "Choose the best tool from the provided list by yourself. "
-                                "Do not answer in plain text.\nAssistant:"
-                            )
+                        force_text = "[MANDATORY NEXT STEP]: You MUST output exactly one ##TOOL_CALL## block now. Choose the best tool from the provided list by yourself. Do not answer in plain text."
+                        current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:" if current_prompt.endswith("Assistant:") else current_prompt + "\n\n" + force_text + "\nAssistant:"
                         log.warning(f"[ToolParse-ANT] 模型返回空响应或无工具调用，重试 (attempt {stream_attempt+1}/{max_attempts})")
                         await asyncio.sleep(0.15)
                         continue
-                else:
-                    blocks = [{"type": "text", "text": answer_text}]
-                    stop_reason = "end_turn"
 
-                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model_name, 'stop_reason': None, 'usage': {'input_tokens': len(current_prompt), 'output_tokens': 0}}})}\n\n"
-
-                block_idx = 0
-
-                if reasoning_text:
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})}\n\n"
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                for packet in ensure_message_start():
+                    yield packet
+                if not emitted_payload and reasoning_text:
+                    yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'thinking', 'thinking': ''}})
+                    yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})
+                    yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
                     block_idx += 1
-
                 for blk in blocks:
                     if blk["type"] == "text" and blk.get("text"):
-                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'text_delta', 'text': blk['text']}})}\n\n"
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                        yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'text', 'text': ''}})
+                        yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'text_delta', 'text': blk['text']}})
+                        yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
                         block_idx += 1
-                    elif blk["type"] == "tool_use":
-                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'tool_use', 'id': blk['id'], 'name': blk['name'], 'input': {}}})}\n\n"
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(blk.get('input', {}), ensure_ascii=False)}})}\n\n"
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_idx})}\n\n"
+                    elif blk["type"] == "tool_use" and not emitted_payload:
+                        yield _anthropic_sse('content_block_start', {'type': 'content_block_start', 'index': block_idx, 'content_block': {'type': 'tool_use', 'id': blk['id'], 'name': blk['name'], 'input': {}}})
+                        yield _anthropic_sse('content_block_delta', {'type': 'content_block_delta', 'index': block_idx, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(blk.get('input', {}), ensure_ascii=False)}})
+                        yield _anthropic_sse('content_block_stop', {'type': 'content_block_stop', 'index': block_idx})
                         block_idx += 1
 
-                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': len(answer_text)}})}\n\n"
-                yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-                
+                yield _anthropic_sse('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': stop_reason}, 'usage': {'output_tokens': len(answer_text)}})
+                yield _anthropic_sse('message_stop', {'type': 'message_stop'})
+
                 users = await users_db.get()
                 for u in users:
                     if u["id"] == token:
                         u["used_tokens"] += len(answer_text) + len(prompt)
                         break
                 await users_db.save(users)
-
-                if acc is not None:
-                    client.account_pool.release(acc)
-                    if chat_id:
-
-                        asyncio.create_task(client.delete_chat(acc.token, chat_id))
+                await _release_stream_account(client, acc, chat_id)
                 return
               except HTTPException as he:
                 yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': he.detail}})}\n\n"

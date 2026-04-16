@@ -1,6 +1,7 @@
 """httpx/curl_cffi 引擎：使用浏览器指纹直连 Qwen API。"""
 
 import asyncio
+import codecs
 import json
 import logging
 
@@ -25,6 +26,25 @@ _HEADERS = {
 }
 
 _IMPERSONATE = "chrome124"
+
+
+def _split_sse_messages(buffer: str) -> tuple[list[str], str]:
+    """提取完整 SSE 消息，保留末尾未闭合片段以避免分块截断。
+
+    参数:
+        buffer: 当前累计的 SSE 文本缓冲区。
+    返回:
+        tuple[list[str], str]: 已闭合消息列表与剩余未闭合文本。
+    边界条件:
+        当上游事件恰好被拆在 chunk 边界时，不会提前产出半条消息。
+    """
+    messages: list[str] = []
+    while True:
+        sep_index = buffer.find("\n\n")
+        if sep_index == -1:
+            return messages, buffer
+        messages.append(buffer[:sep_index])
+        buffer = buffer[sep_index + 2:]
 
 
 class HttpxEngine:
@@ -68,7 +88,18 @@ class HttpxEngine:
             return {"status": 0, "body": str(exc)}
 
     async def fetch_chat(self, token: str, chat_id: str, payload: dict, buffered: bool = False):
-        """通过 curl_cffi 发送 SSE 聊天请求并逐块产出响应。"""
+        """通过 curl_cffi 发送 SSE 聊天请求并按完整事件逐步产出响应。
+
+        参数:
+            token: 上游账号 Bearer Token。
+            chat_id: 已创建的上游会话 ID。
+            payload: 发送给上游的聊天请求体。
+            buffered: 兼容旧接口的保留参数，当前不启用整包缓冲。
+        返回:
+            async generator: 逐条产出完整 SSE 消息或错误结果。
+        边界条件:
+            UTF-8 多字节字符和 SSE 事件都可能横跨网络 chunk，必须等消息闭合后再下发。
+        """
         from curl_cffi.requests import AsyncSession
 
         url = self.base_url + f"/api/v2/chat/completions?chat_id={chat_id}"
@@ -85,8 +116,18 @@ class HttpxEngine:
                         body_text = b"".join(body_chunks).decode(errors="replace")[:2000]
                         yield {"status": resp.status_code, "body": body_text}
                         return
+                    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                    pending = ""
                     async for chunk in resp.aiter_content():
-                        yield {"status": "streamed", "chunk": chunk.decode("utf-8", errors="replace")}
+                        pending += decoder.decode(chunk)
+                        pending = pending.replace("\r\n", "\n").replace("\r", "\n")
+                        messages, pending = _split_sse_messages(pending)
+                        for message in messages:
+                            yield {"status": "streamed", "chunk": f"{message}\n\n"}
+                    pending += decoder.decode(b"", final=True)
+                    pending = pending.replace("\r\n", "\n").replace("\r", "\n")
+                    if pending:
+                        yield {"status": "streamed", "chunk": pending}
         except Exception as exc:
             log.error(f"[HttpxEngine] fetch_chat error: {exc}")
             yield {"status": 0, "body": str(exc)}

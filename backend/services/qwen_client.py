@@ -28,6 +28,34 @@ def _is_banned_error(error_msg: str) -> bool:
     return any(keyword in msg for keyword in BANNED_KEYWORDS)
 
 
+def _extract_sse_payloads(chunk: str) -> list[str]:
+    """从一段 SSE 文本里提取完整 data payload 列表。
+
+    参数:
+        chunk: 包含一个或多个 SSE 事件片段的原始文本。
+    返回:
+        list[str]: 去掉 `data:` 前缀与空事件后的 payload 列表。
+    边界条件:
+        兼容多行 `data:`、CRLF/LF 混用和尾部没有空行终止的最后一个事件。
+    """
+    payloads = []
+    current = []
+    for raw_line in chunk.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw_line == "":
+            if current:
+                payloads.append("\n".join(current))
+                current = []
+            continue
+        if raw_line.startswith("data:"):
+            payload = raw_line[5:]
+            if payload.startswith(" "):
+                payload = payload[1:]
+            current.append(payload)
+    if current:
+        payloads.append("\n".join(current))
+    return [payload for payload in payloads if payload and payload != "[DONE]"]
+
+
 def _is_unauthorized_response(status: int, body_text: str) -> bool:
     """判断创建会话响应是否属于鉴权或账号状态错误。"""
     return (
@@ -234,22 +262,21 @@ class QwenClient:
         }
 
     def parse_sse_chunk(self, chunk: str) -> list[dict]:
-        events = []
-        for line in chunk.splitlines():
-            line = line.strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == "[DONE]":
-                continue
+        """把 SSE 文本块解析成统一 delta 事件结构。
+
+        参数:
+            chunk: 单个或多个 SSE 事件组成的原始文本块。
+        返回:
+            list[dict]: 统一后的 delta 事件列表，字段包含 phase、content、status、extra。
+        边界条件:
+            遇到坏 JSON 事件时会跳过该事件，但不会影响同一文本块里其他合法事件的解析。
+        """
+        parsed = []
+        for payload in _extract_sse_payloads(chunk):
             try:
-                obj = json.loads(data)
-                events.append(obj)
+                evt = json.loads(payload)
             except Exception:
                 continue
-
-        parsed = []
-        for evt in events:
             if evt.get("choices"):
                 delta = evt["choices"][0].get("delta", {})
                 parsed.append({
@@ -257,15 +284,16 @@ class QwenClient:
                     "phase": delta.get("phase", "answer"),
                     "content": delta.get("content", ""),
                     "status": delta.get("status", ""),
-                    "extra": delta.get("extra", {})
+                    "extra": delta.get("extra", {}),
                 })
-            elif evt.get("phase"):
+                continue
+            if evt.get("phase"):
                 parsed.append({
                     "type": "delta",
                     "phase": evt.get("phase", "answer"),
                     "content": evt.get("content", "") or evt.get("text", "") or "",
                     "status": evt.get("status", ""),
-                    "extra": evt.get("extra", {})
+                    "extra": evt.get("extra", {}),
                 })
         return parsed
 

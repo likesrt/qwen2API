@@ -2,7 +2,7 @@
 hybrid_engine.py — mix browser stability with httpx speed.
 Phase 1 policy:
 - api_call: httpx first, browser fallback on failures
-- fetch_chat: browser first (real browser TLS/env), httpx fallback on browser failures
+- fetch_chat: httpx first, browser fallback on failures
 """
 
 import logging
@@ -48,7 +48,7 @@ class HybridEngine:
         log.info("[HybridEngine] 第一步完成：httpx 已启动，继续启动浏览器引擎")
         await self.browser_engine.start()
         self._started = bool(getattr(self.httpx_engine, "_started", False) and getattr(self.browser_engine, "_started", False))
-        log.info(f"[HybridEngine] 已启动：api_call=httpx优先，fetch_chat=browser优先，started={self._started} browser_started={getattr(self.browser_engine, '_started', False)} httpx_started={getattr(self.httpx_engine, '_started', False)}")
+        log.info(f"[HybridEngine] 已启动：api_call=httpx优先，fetch_chat=httpx优先，started={self._started} browser_started={getattr(self.browser_engine, '_started', False)} httpx_started={getattr(self.httpx_engine, '_started', False)}")
 
     async def stop(self):
         try:
@@ -71,47 +71,50 @@ class HybridEngine:
         return result
 
     async def fetch_chat(self, token: str, chat_id: str, payload: dict, buffered: bool = False):
-        log.info(f"[HybridEngine] fetch_chat 路由：优先走 browser，chat_id={chat_id} buffered={buffered}")
+        """优先使用直连流式通道，失败后再回退浏览器通道。
+
+        参数:
+            token: 上游账号 Bearer Token。
+            chat_id: 已创建的上游会话 ID。
+            payload: 发送给上游的聊天请求体。
+            buffered: 兼容旧接口的保留参数，透传到底层引擎。
+        返回:
+            async generator: 连续产出底层引擎返回的流式分片或错误对象。
+        边界条件:
+            只要首个成功分片已经发出，就不再切换引擎，避免客户端收到重复内容。
+        """
+        log.info(f"[HybridEngine] fetch_chat 路由：优先走 httpx，chat_id={chat_id} buffered={buffered}")
         saw_success = False
-        browser_error = None
+        upstream_error = None
         try:
-            async for item in self.browser_engine.fetch_chat(token, chat_id, payload, buffered=buffered):
+            async for item in self.httpx_engine.fetch_chat(token, chat_id, payload, buffered=buffered):
                 status = item.get("status")
                 if status in ("streamed", 200):
                     saw_success = True
                     yield item
                     continue
-                # 浏览器返回错误，判断是否需要回退
                 body_text = (item.get("body") or "").lower()
-                is_hard_failure = (
-                    status in (401, 403, 429)
-                    or "waf" in body_text
-                    or "<!doctype" in body_text
-                    or "forbidden" in body_text
-                    or "unauthorized" in body_text
-                )
-                if is_hard_failure and not saw_success:
-                    browser_error = item
+                if _should_fallback(status, body_text) and not saw_success:
+                    upstream_error = item
                     break
-                # 浏览器引擎自身错误（evaluate失败等），也回退
                 if status == 0 and not saw_success:
-                    browser_error = item
+                    upstream_error = item
                     break
                 yield item
-            if browser_error is None:
+            if upstream_error is None:
                 return
-        except Exception as e:
+        except Exception as exc:
             if saw_success:
                 return
-            browser_error = {"status": 0, "body": str(e)}
+            upstream_error = {"status": 0, "body": str(exc)}
 
-        preview = ((browser_error.get("body") or "")[:160]).replace("\n", "\\n") if isinstance(browser_error, dict) else str(browser_error)[:160]
+        preview = ((upstream_error.get("body") or "")[:160]).replace("\n", "\\n") if isinstance(upstream_error, dict) else str(upstream_error)[:160]
         log.warning(
-            f"[HybridEngine] fetch_chat browser 失败，回退到 httpx：chat_id={chat_id} "
-            f"status={browser_error.get('status') if isinstance(browser_error, dict) else 'unknown'} "
+            f"[HybridEngine] fetch_chat httpx 失败，回退到 browser：chat_id={chat_id} "
+            f"status={upstream_error.get('status') if isinstance(upstream_error, dict) else 'unknown'} "
             f"body_preview={preview!r}"
         )
-        async for item in self.httpx_engine.fetch_chat(token, chat_id, payload, buffered=buffered):
+        async for item in self.browser_engine.fetch_chat(token, chat_id, payload, buffered=buffered):
             yield item
 
     def status(self) -> dict:
@@ -128,7 +131,7 @@ class HybridEngine:
         return {
             "started": self._started,
             "mode": "hybrid",
-            "stream_via": "browser_first",
+            "stream_via": "httpx_first",
             "api_via": "httpx_first",
             "browser_started": getattr(self.browser_engine, "_started", False),
             "httpx_started": getattr(self.httpx_engine, "_started", False),
