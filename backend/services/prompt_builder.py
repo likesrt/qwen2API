@@ -1,5 +1,7 @@
 import json
 import logging
+from contextvars import ContextVar
+from typing import Optional
 
 log = logging.getLogger("qwen2api.prompt")
 
@@ -7,6 +9,7 @@ NEEDSREVIEW_MARKERS = (
     "需求回显", "已了解规则", "等待用户输入", "待执行任务", "待确认事项",
     "[需求回显]", "**需求回显**",
 )
+_REQUEST_FEATURE_CONFIG: ContextVar[Optional[dict]] = ContextVar("request_feature_config", default=None)
 
 
 def _trim_middle(text: str, limit: int, marker: str = "...[truncated]") -> str:
@@ -375,15 +378,134 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list) -> 
 
 
 
+def set_request_feature_config_override(feature_config: Optional[dict]) -> None:
+    """记录当前请求的功能开关覆盖项。
+
+    参数:
+        feature_config: 当前请求解析得到的 feature_config 覆盖项。
+    返回:
+        None: 仅更新当前协程上下文，不返回额外数据。
+    边界条件:
+        当请求没有显式覆盖项时会写入 None，避免后续请求复用旧上下文。
+    """
+    _REQUEST_FEATURE_CONFIG.set(dict(feature_config) if isinstance(feature_config, dict) else None)
+
+
+
+def get_request_feature_config_override() -> Optional[dict]:
+    """读取当前请求的功能开关覆盖项。
+
+    参数:
+        无。
+    返回:
+        Optional[dict]: 当前协程上下文中的 feature_config 覆盖项副本。
+    边界条件:
+        当当前请求未显式设置覆盖项时返回 None，调用方应自行回退默认值。
+    """
+    feature_config = _REQUEST_FEATURE_CONFIG.get()
+    return dict(feature_config) if isinstance(feature_config, dict) else None
+
+
+
+def _coerce_bool_flag(value) -> Optional[bool]:
+    """把常见布尔输入归一化为 True、False 或 None。
+
+    参数:
+        value: 原始请求中的布尔型、数字型、字符串型或容器型值。
+    返回:
+        Optional[bool]: 可识别时返回布尔值，否则返回 None。
+    边界条件:
+        空列表、空字典和空字符串会按 False 处理；无法识别的字符串不会强行猜测。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on", "enabled"):
+            return True
+        if lowered in ("0", "false", "no", "off", "disabled", ""):
+            return False
+        return None
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return None
+
+
+
+def _extract_openai_feature_config_override(req_data: dict) -> Optional[dict]:
+    """提取 OpenAI 风格请求中的功能开关覆盖项。
+
+    参数:
+        req_data: 下游兼容接口收到的原始请求体。
+    返回:
+        Optional[dict]: 可直接传给上游 feature_config 的覆盖项。
+    边界条件:
+        未显式传入的字段不会写入结果，避免覆盖默认逻辑。
+    """
+    override = {}
+    # Cherry Studio 等 OpenAI 兼容客户端会直接透传 enable_thinking；这里只记录显式输入，避免覆盖默认策略。
+    thinking_enabled = _coerce_bool_flag(req_data.get("enable_thinking"))
+    if thinking_enabled is not None:
+        override["thinking_enabled"] = thinking_enabled
+    for source_key, target_key in (("auto_search", "auto_search"), ("code_interpreter", "code_interpreter"), ("plugins_enabled", "plugins_enabled"), ("plugins", "plugins_enabled")):
+        flag = _coerce_bool_flag(req_data.get(source_key))
+        if flag is not None:
+            override[target_key] = flag
+    return override or None
+
+
+
+def _extract_anthropic_feature_config_override(req_data: dict) -> Optional[dict]:
+    """提取 Anthropic 风格请求中的思考开关覆盖项。
+
+    参数:
+        req_data: 下游兼容接口收到的原始请求体。
+    返回:
+        Optional[dict]: 可直接传给上游 feature_config 的覆盖项。
+    边界条件:
+        仅识别 `thinking.type` 里的 enabled、disabled、adaptive；未知结构会回退为 None。
+    """
+    # Anthropic Messages API 用 thinking.type 表达启停；budget_tokens 对当前上游 feature_config 没有直接映射，因此这里只处理开关。
+    thinking = req_data.get("thinking")
+    if not isinstance(thinking, dict):
+        return None
+    thinking_type = str(thinking.get("type", "")).strip().lower()
+    if thinking_type in ("enabled", "adaptive"):
+        return {"thinking_enabled": True}
+    if thinking_type == "disabled":
+        return {"thinking_enabled": False}
+    return None
+
+
+
+def _extract_request_feature_config_override(req_data: dict) -> Optional[dict]:
+    """汇总当前请求里的功能开关覆盖项。
+
+    参数:
+        req_data: 下游兼容接口收到的原始请求体。
+    返回:
+        Optional[dict]: 合并后的 feature_config 覆盖项。
+    边界条件:
+        OpenAI 与 Anthropic 风格字段会合并；没有显式配置时返回 None。
+    """
+    override = _extract_openai_feature_config_override(req_data) or {}
+    anthropic_override = _extract_anthropic_feature_config_override(req_data) or {}
+    override.update(anthropic_override)
+    return override or None
+
+
+
 def messages_to_prompt(req_data: dict) -> tuple:
-    """从请求体提取消息与工具，并生成最终提示词。
+    """从请求体提取消息、工具与功能开关，并生成最终提示词。
 
     参数:
         req_data: 下游兼容接口收到的原始请求体。
     返回:
         tuple: `(prompt, tools)`，分别是最终提示词与归一化工具列表。
     边界条件:
-        当 system 字段缺失时，会回退到 messages 里的 system 消息。
+        当 system 字段缺失时，会回退到 messages 里的 system 消息，并刷新当前请求的功能开关上下文。
     """
     messages = req_data.get("messages", [])
     tools = _normalize_tools(req_data.get("tools", []))
@@ -395,4 +517,5 @@ def messages_to_prompt(req_data: dict) -> tuple:
         system_prompt = sys_field
     if not system_prompt:
         system_prompt = next((_extract_text(msg.get("content", "")) for msg in messages if msg.get("role") == "system"), "")
+    set_request_feature_config_override(_extract_request_feature_config_override(req_data))
     return build_prompt_with_tools(system_prompt, messages, tools), tools

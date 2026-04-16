@@ -2,12 +2,14 @@ import asyncio
 import json
 import logging
 import time
+import traceback
 import uuid
 from typing import Optional, Any
 from backend.core.account_pool import AccountPool, Account
 from backend.core.config import settings
 from backend.core.proxy import proxy_manager
 from backend.services.auth_resolver import AuthResolver
+from backend.services.prompt_builder import get_request_feature_config_override
 
 log = logging.getLogger("qwen2api.client")
 
@@ -87,6 +89,28 @@ def _parse_chat_id(body_text: str) -> str:
     return data["data"]["id"]
 
 
+def _format_delete_chat_stack() -> str:
+    """格式化 delete_chat 的调用栈，便于定位重复清理来源。
+
+    参数:
+        无。
+    返回:
+        str: 过滤当前工具函数帧后的紧凑调用栈文本。
+    边界条件:
+        当调用栈不足或格式化失败时，会返回可打印的兜底文本，避免诊断日志本身抛错。
+    """
+    try:
+        frames = traceback.extract_stack()[:-2]
+        if not frames:
+            return "<empty stack>"
+        return " | ".join(
+            f"{frame.filename}:{frame.lineno} in {frame.name}"
+            for frame in frames[-8:]
+        )
+    except Exception as exc:
+        return f"<stack format failed: {exc}>"
+
+
 class QwenClient:
     def __init__(self, engine: Any, account_pool: AccountPool):
         self.engine = engine
@@ -116,7 +140,18 @@ class QwenClient:
             raise e
 
     async def delete_chat(self, token: str, chat_id: str):
-        """删除上游会话，并复用当前引擎的最优路由策略。"""
+        """删除上游会话，并记录调用来源，便于排查重复清理。
+
+        参数:
+            token: 当前账号的上游 Bearer Token。
+            chat_id: 需要删除的上游会话 ID。
+        返回:
+            None: 仅执行删除请求，不返回额外数据。
+        边界条件:
+            每次调用都会打印精简调用栈；当重复删除同一 chat 时，可直接从日志比对来源。
+        """
+        stack_text = _format_delete_chat_stack()
+        log.info(f"[delete_chat] 准备删除会话：chat_id={chat_id} stack={stack_text}")
         await self.engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
 
     async def verify_token(self, token: str) -> bool:
@@ -192,21 +227,127 @@ class QwenClient:
         except Exception:
             return []
 
-    def _build_payload(self, chat_id: str, model: str, content: str, has_custom_tools: bool = False) -> dict:
-        ts = int(time.time())
-        # 有工具时关闭思考模式——工具调用只需要输出结构化 JSON，思考会白白浪费几十秒
-        feature_config = {
-            "thinking_enabled": not has_custom_tools,
+    def _extract_feature_config_override(self, feature_config_override: Optional[dict]) -> dict:
+        """归一化当前请求的功能开关覆盖项。
+
+        参数:
+            feature_config_override: 调用方显式传入的覆盖项。
+        返回:
+            dict: 仅保留当前网关支持的布尔开关。
+        边界条件:
+            当调用方未传入覆盖项时，会回退到当前请求上下文，避免兼容层重复解析。
+        """
+        # 兼容层已经在 request 入口解析过 OpenAI / Anthropic 的 thinking 开关；这里统一从显式参数或上下文里取最终覆盖值。
+        raw_override = feature_config_override or get_request_feature_config_override()
+        if not isinstance(raw_override, dict):
+            return {}
+        keys = ("thinking_enabled", "auto_search", "code_interpreter", "plugins_enabled")
+        return {key: bool(raw_override[key]) for key in keys if key in raw_override}
+
+    def _set_thinking_feature(self, feature_config: dict, enabled: bool) -> None:
+        """同步更新与思考相关的上游功能字段。
+
+        参数:
+            feature_config: 当前待发送的 feature_config。
+            enabled: 是否启用思考模式。
+        返回:
+            None: 直接修改 feature_config，不返回额外数据。
+        边界条件:
+            关闭思考时会同步关闭 auto_thinking 并把 thinking_mode 设为 off，避免上游仍进入思考阶段。
+        """
+        feature_config["thinking_enabled"] = enabled
+        feature_config["auto_thinking"] = enabled
+        feature_config["thinking_mode"] = "Auto" if enabled else "off"
+
+    def _base_chat_feature_config(self) -> dict:
+        """构造普通文本对话的默认功能开关。
+
+        参数:
+            无。
+        返回:
+            dict: 默认的 feature_config 配置。
+        边界条件:
+            根据当前需求，thinking 与 auto_search 默认关闭，其余能力继续沿用原有非工具模式默认值。
+        """
+        return {
+            "thinking_enabled": False,
             "output_schema": "phase",
             "research_mode": "normal",
-            "auto_thinking": not has_custom_tools,
-            "thinking_mode": "off" if has_custom_tools else "Auto",
+            "auto_thinking": False,
+            "thinking_mode": "off",
             "thinking_format": "summary",
-            "auto_search": not has_custom_tools,
-            "code_interpreter": not has_custom_tools,
-            "function_calling": bool(has_custom_tools and settings.NATIVE_TOOL_PASSTHROUGH),
-            "plugins_enabled": False if has_custom_tools else True,
+            "auto_search": False,
+            "code_interpreter": True,
+            "function_calling": False,
+            "plugins_enabled": True,
         }
+
+    def _apply_feature_config_override(self, feature_config: dict, feature_config_override: dict) -> None:
+        """把当前请求的覆盖项合并到默认功能开关里。
+
+        参数:
+            feature_config: 当前待发送的 feature_config。
+            feature_config_override: 当前请求显式声明的覆盖项。
+        返回:
+            None: 直接修改 feature_config，不返回额外数据。
+        边界条件:
+            只有被显式声明的字段才会覆盖默认值，避免客户端未传入时误伤默认策略。
+        """
+        if "thinking_enabled" in feature_config_override:
+            self._set_thinking_feature(feature_config, feature_config_override["thinking_enabled"])
+        for key in ("auto_search", "code_interpreter", "plugins_enabled"):
+            if key in feature_config_override:
+                feature_config[key] = feature_config_override[key]
+
+    def _apply_tool_mode_feature_config(self, feature_config: dict) -> None:
+        """把功能开关切换到工具调用模式。
+
+        参数:
+            feature_config: 当前待发送的 feature_config。
+        返回:
+            None: 直接修改 feature_config，不返回额外数据。
+        边界条件:
+            工具模式下会强制关闭思考、搜索、插件与代码解释器，只保留必要的 function_calling。
+        """
+        self._set_thinking_feature(feature_config, False)
+        feature_config["auto_search"] = False
+        feature_config["code_interpreter"] = False
+        feature_config["plugins_enabled"] = False
+        feature_config["function_calling"] = bool(settings.NATIVE_TOOL_PASSTHROUGH)
+
+    def _build_chat_feature_config(self, has_custom_tools: bool, feature_config_override: Optional[dict] = None) -> dict:
+        """构造普通文本对话的上游功能开关。
+
+        参数:
+            has_custom_tools: 当前请求是否启用了自定义工具。
+            feature_config_override: 当前请求显式声明的功能开关覆盖项。
+        返回:
+            dict: 发给上游的 feature_config 配置。
+        边界条件:
+            thinking 与 auto_search 默认关闭；工具模式会覆盖任何请求侧设置，避免工具轮次被思考拖慢。
+        """
+        feature_config = self._base_chat_feature_config()
+        self._apply_feature_config_override(feature_config, self._extract_feature_config_override(feature_config_override))
+        if has_custom_tools:
+            self._apply_tool_mode_feature_config(feature_config)
+        return feature_config
+
+    def _build_payload(self, chat_id: str, model: str, content: str, has_custom_tools: bool = False, feature_config_override: Optional[dict] = None) -> dict:
+        """构造普通文本对话的上游请求体。
+
+        参数:
+            chat_id: 当前上游会话 ID。
+            model: 本次请求使用的模型名。
+            content: 已构造完成的提示词内容。
+            has_custom_tools: 当前请求是否启用了自定义工具。
+            feature_config_override: 当前请求显式声明的功能开关覆盖项。
+        返回:
+            dict: 可直接提交给上游聊天接口的 JSON 请求体。
+        边界条件:
+            当调用方未显式传入覆盖项时，会自动读取当前请求上下文里的兼容层设置。
+        """
+        ts = int(time.time())
+        feature_config = self._build_chat_feature_config(has_custom_tools, feature_config_override)
         return {
             "stream": True, "version": "2.1", "incremental_output": True,
             "chat_id": chat_id, "chat_mode": "normal", "model": model, "parent_id": None,
@@ -315,7 +456,14 @@ class QwenClient:
         if acc is not None and chat_id:
             asyncio.create_task(self.delete_chat(acc.token, chat_id))
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None):
+    async def chat_stream_events_with_retry(
+        self,
+        model: str,
+        content: str,
+        has_custom_tools: bool = False,
+        exclude_accounts: Optional[set[str]] = None,
+        feature_config_override: Optional[dict] = None,
+    ):
         """按账号池重试流式请求，并在取消时主动回收会话资源。
 
         参数:
@@ -323,6 +471,7 @@ class QwenClient:
             content: 已构造好的提示词文本。
             has_custom_tools: 当前请求是否启用了自定义工具。
             exclude_accounts: 本轮重试需要排除的账号邮箱集合。
+            feature_config_override: 前端或下游请求显式传入的功能开关覆盖项。
         返回:
             async generator: 先产出 meta，再持续产出解析后的 event。
         边界条件:

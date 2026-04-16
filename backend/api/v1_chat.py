@@ -17,8 +17,8 @@ from backend.core.config import resolve_model, settings, IMAGE_MODEL_DEFAULT
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
 
-async def _stream_events_with_cleanup(client: QwenClient, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
-    """包装上游事件流，在下游取消时主动回收账号和会话。
+async def _stream_events_with_cleanup(client: QwenClient, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None, cancel_state: Optional[dict] = None):
+    """包装上游事件流，在下游取消时按来源决定是否回收会话。
 
     参数:
         client: 当前 QwenClient 实例。
@@ -26,10 +26,11 @@ async def _stream_events_with_cleanup(client: QwenClient, model: str, prompt: st
         prompt: 已构造完成的提示词。
         has_custom_tools: 是否启用了工具模式。
         exclude_accounts: 当前轮次需要排除的账号集合。
+        cancel_state: 共享取消状态；内部主动停流时会标记跳过清理。
     返回:
         async generator: 原样转发 meta 与 event 项。
     边界条件:
-        客户端断开会触发取消，此时会删除上游 chat 并释放 inflight 占用。
+        只有真实客户端断开才会触发 `_abort_active_chat`；内部提前收尾不会重复删除 chat。
     """
     acc: Optional[Account] = None
     chat_id: Optional[str] = None
@@ -42,8 +43,30 @@ async def _stream_events_with_cleanup(client: QwenClient, model: str, prompt: st
                     acc = meta_acc
             yield item
     except aio.CancelledError:
-        await client._abort_active_chat(acc, chat_id)
+        if not cancel_state or not cancel_state.get("internal_stop"):
+            await client._abort_active_chat(acc, chat_id)
         raise
+
+
+async def _stop_stream_producer(producer_task, cancel_state: dict) -> None:
+    """停止后台生产者任务，并标记这是内部收尾而不是客户端断开。
+
+    参数:
+        producer_task: 当前 keepalive 包装层持有的后台任务。
+        cancel_state: 与生产者共享的取消状态字典。
+    返回:
+        None: 仅负责停止后台任务，不返回额外数据。
+    边界条件:
+        当任务已自然结束时会直接返回，避免重复 cancel 触发误清理。
+    """
+    if producer_task.done():
+        return
+    cancel_state["internal_stop"] = True
+    producer_task.cancel()
+    try:
+        await producer_task
+    except aio.CancelledError:
+        pass
 
 
 def _oai_error_payload(detail) -> dict:
@@ -78,7 +101,7 @@ def _oai_error_chunk(detail) -> str:
 
 
 async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
-    """为上游事件流增加 keepalive，并在消费端断开时停止生产者。
+    """为上游事件流增加 keepalive，并区分内部停流与真实断连。
 
     参数:
         client: 当前 QwenClient 实例。
@@ -89,13 +112,21 @@ async def _stream_items_with_keepalive(client, model: str, prompt: str, has_cust
     返回:
         async generator: 轮询队列后连续产出 item、error 或 keepalive。
     边界条件:
-        客户端断开会取消 producer task，避免后台继续占用上游流式连接。
+        调用方若提前结束消费，后台任务会被标记为内部收尾，避免误触发 `_abort_active_chat`。
     """
     queue: aio.Queue = aio.Queue()
+    cancel_state = {"internal_stop": False}
 
     async def _producer():
         try:
-            async for item in _stream_events_with_cleanup(client, model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
+            async for item in _stream_events_with_cleanup(
+                client,
+                model,
+                prompt,
+                has_custom_tools=has_custom_tools,
+                exclude_accounts=exclude_accounts,
+                cancel_state=cancel_state,
+            ):
                 await queue.put(("item", item))
         except Exception as e:
             await queue.put(("error", e))
@@ -118,12 +149,7 @@ async def _stream_items_with_keepalive(client, model: str, prompt: str, has_cust
             elif kind == "done":
                 break
     finally:
-        if not producer_task.done():
-            producer_task.cancel()
-            try:
-                await producer_task
-            except aio.CancelledError:
-                pass
+        await _stop_stream_producer(producer_task, cancel_state)
 
 def _extract_blocked_tool_names(text: str) -> list[str]:
     if not text:
@@ -467,6 +493,7 @@ async def chat_completions(request: Request):
                 if not tools:
                     sent_role = False
                     streamed_len = 0
+                    streamed_any = False
                     async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=False, exclude_accounts=excluded_accounts):
                         if item["type"] == "keepalive":
                             yield ": keepalive\n\n"
@@ -485,20 +512,23 @@ async def chat_completions(request: Request):
                             continue
                         phase = evt.get("phase", "")
                         content = evt.get("content", "")
-                        if phase == "answer" and content:
+                        if phase in ("think", "thinking_summary") and content:
                             if not sent_role:
-                                mk = lambda delta, finish=None: json.dumps({
-                                    "id": completion_id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model_name,
-                                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
-                                }, ensure_ascii=False)
-                                yield f"data: {mk({'role': 'assistant'})}\n\n"
+                                yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
                                 sent_role = True
+                            streamed_any = True
+                            # Chat Completions 官方没有标准化 reasoning_content；这里继续透传网关扩展字段，兼容 Cherry Studio 等前端展示思考块。
+                            yield _oai_chunk_payload(completion_id, created, model_name, {"reasoning_content": content})
+                        elif phase == "answer" and content:
+                            if not sent_role:
+                                yield _oai_chunk_payload(completion_id, created, model_name, {"role": "assistant"})
+                                sent_role = True
+                            streamed_any = True
                             streamed_len += len(content)
-                            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+                            yield _oai_chunk_payload(completion_id, created, model_name, {"content": content})
 
-                    # 空响应重试（还没发过内容才重试）
-                    if streamed_len == 0 and stream_attempt < min(settings.EMPTY_RESPONSE_RETRIES, max_attempts - 1):
+                    # 空响应重试（还没发过任何有效分片才重试）
+                    if not streamed_any and stream_attempt < min(settings.EMPTY_RESPONSE_RETRIES, max_attempts - 1):
                         if acc is not None:
                             client.account_pool.release(acc)
                             if chat_id:
